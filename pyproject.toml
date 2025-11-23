@@ -25,7 +25,11 @@ classifiers = [
 description = "A GPU-accelerated physics engine for robotics simulation"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["warp-lang>=1.7.0.dev20250823"]
+dependencies = [
+    "pymeshlab>=2025.7",
+    "trimesh>=4.9.0",
+    "warp-lang>=1.7.0.dev20250823",
+]
 
 [project.optional-dependencies]
 # Core simulation dependencies
@@ -113,7 +117,7 @@ explicit = true
 mujoco-warp = { git = "https://github.com/google-deepmind/mujoco_warp" }
 warp-lang = { index = "nvidia" }
 mujoco = { index = "mujoco" }
-torch = [{ index = "pytorch-cu129", extra = "torch-cu12" }]
+torch = [{ index = "pytorch-cu128", extra = "torch-cu12" }]
 
 [dependency-groups]
 dev = ["asv>=0.6.4"]
@@ -125,8 +129,8 @@ indent-width = 4
 exclude = []
 
 [[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.ruff.lint]

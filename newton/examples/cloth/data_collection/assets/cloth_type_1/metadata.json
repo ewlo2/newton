@@ -1,0 +1,41 @@
+{
+  "source_mesh_file": "mesh_centered_remeshed.obj",
+  "orientation": {
+    "base_rotation": {
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "degrees": 90.0
+    },
+    "default_z_rotation_degrees": 0.0
+  },
+  "center_offset": [
+    0.5,
+    0.25,
+    0.25
+  ],
+  "downsampling": {
+    "perform_remeshing": true,
+    "method": "isotropic_explicit_remeshing",
+    "edge_length_percentage": 0.65
+  },
+  "cloth_parameters": {
+    "density": 0.2,
+    "scale": 1.0,
+    "tri_ke": 100.0,
+    "tri_ka": 100.0,
+    "tri_kd": 1.5e-06,
+    "edge_ke": 0.0001,
+    "edge_kd": 0.001,
+    "particle_radius": 0.006
+  },
+  "mesh_file": "mesh_centered_remeshed.obj",
+  "quadrant_indices_file": "quadrant_indices.json",
+  "vertex_count": 15298,
+  "preprocessed": {
+    "centered": true,
+    "remeshed": true
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "simulation": {
+    "n_env": 1,
+    "iterations": 10,
+    "num_frames": 1000,
+    "seed": 42,
+    "save_interval": 1,
+    "viewer": "gl",
+    "device": "cuda:0",
+    
+    "add_cloth": true,
+    "add_robot": true,
+    "fps": 60,
+    "sim_substeps": 15,
+    "replicate_spacing": [3, 3, 0],
+    "gravity": [0.0, 0.0, -9.81]
+  },
+  "paths": {
+    "out_dir": "output",
+    "cloth_library_dir": "assets",
+    "mesh_file": null
+  },
+  "cloth": {
+    "source": "library",
+    "orientation": {
+      "use_default": false,
+      "sampling_degrees": [-180, 180]
+    },
+    "keep_flat": true,
+    "use_same_mesh_per_env": true,
+    "base_position": [0.5, 0.25, 0.25],
+    
+    "solver_iterations": 5
+  },
+  "trajectory": {
+    "position_noise_std": 0.02,
+    "timing_noise_std": 0.1,
+    "grasp_height": 0.185,
+    "lift_height": 0.5,
+    "drop_offset_range": [-0.15, 0.15],
+    "cloth_extent_m": 0.4,
+    "timing": {
+      "grasp_dwell": 1.5,
+      "drop_dwell": 1.5
+    },
+    "orientations": {
+      "down_quat": [1.0, 0.0, 0.0, 0.0]
+    }
+  },
+  "data_collection": {
+    "grasp_offset_steps": 5,
+    "release_offset_steps": 5,
+    "point_sample_rate": 1000,
+    "camera": {
+      "position": [0.5, 0.0, 2.0],
+      "direction": [0.0, 0.0, -1.0],
+      "grid": 256
+    }
+  },
+  "contact": {
+    "table_top_z": 0.20,
+    "ee_radius": 0.035,
+    "table_margin": 0.003,
+    
+    "cloth_body_contact_margin": 0.01,
+    "self_contact_radius": 0.002,
+    "self_contact_margin": 0.003,
+    "soft_contact_ke": 100.0,
+    "soft_contact_kd": 0.002,
+    "robot_friction": 1.0,
+    "table_friction": 0.5,
+    "self_contact_friction": 0.25,
+    "table_half_extent_x": 0.65,
+    "table_half_extent_y": 0.65,
+    "table_half_height": 0.1,
+    "table_pos_x": 0.5,
+    "table_pos_y": 0.0
+  },
+  "control": {
+    "gripper_open": 0.8,
+    "gripper_closed": 0.03,
+    "endeffector_offset": [0.0, 0.0, 0.22],
+    "k_null": 1.0,
+    "gripper_scale": 0.04,
+    "use_nullspace": true,
+    "include_rotation": true,
+    "max_joint_qd": 2.0
+  },
+  "robot": {
+    "flip_about_xy": false,
+    "base_position": [-0.25, 0.0, 0.0]
+  }
+}

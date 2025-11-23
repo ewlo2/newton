@@ -1,0 +1,2821 @@
+This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching these patterns are excluded: assets/
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+cloth_franka_env.py
+cloth_preprocessing/__init__.py
+cloth_preprocessing/generate_cloth_metadata.py
+cloth_preprocessing/preprocess_cloth_assets.py
+cloth_preprocessing/README.md
+config.json
+data_collector.py
+example_cloth_franka_thin.py
+example_collect_dataset.py
+kernels.py
+README.md
+simulation_env.py
+trajectory_generator.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="cloth_franka_env.py">
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+###########################################################################
+# Cloth + Franka Simulation Environment
+#
+# This module builds a reusable simulation environment with a Franka robot
+# and a deformable cloth, intended to be imported by dataset collection
+# drivers and tools.
+#
+# Command: python -m newton.examples cloth_franka
+#
+###########################################################################
+
+from __future__ import annotations
+
+import numpy as np
+import warp as wp
+from pxr import Usd, UsdGeom
+
+import newton
+import newton.examples
+import newton.utils
+from newton import Model, ModelBuilder, State, eval_fk
+from newton.solvers import SolverFeatherstone, SolverVBD
+from newton.utils import transform_twist
+from newton.tests.unittest_utils import find_nan_members
+from newton.examples.cloth.data_collection import kernels as dc_kernels
+
+import os 
+import json
+import pymeshlab
+import trimesh
+from typing import Dict, List, Tuple, Optional
+import math
+import time
+
+
+"""
+Note: kernels were moved to newton.examples.cloth.data_collection.kernels
+to consolidate Warp kernels in a single place.
+"""
+
+
+class Example:
+    def __init__(self, viewer, n_env=4, mesh_file: Optional[str] = None, z_rotation: Optional[float] = None, base_position: Optional[Tuple[float, float, float]] = None, config: Optional[Dict] = None):
+        # parameters
+        #   simulation
+        self.config = config
+
+        def _cfg(path: str, default):
+            cur = self.config if isinstance(self.config, dict) else None
+            if cur is None:
+                return default
+            for part in path.split('.'):
+                if isinstance(cur, dict) and part in cur:
+                    cur = cur[part]
+                else:
+                    return default
+            return cur
+
+        self.add_cloth = _cfg("simulation.add_cloth", True)
+        self.add_robot = _cfg("simulation.add_robot", True)
+        self.sim_substeps = int(_cfg("simulation.sim_substeps", 15))
+        # Cloth solver iterations (not dataset iterations)
+        self.iterations = int(_cfg("cloth.solver_iterations", 5))
+        self.fps = float(_cfg("simulation.fps", 60))
+        self.frame_dt = 1 / self.fps
+        self.sim_dt = self.frame_dt / self.sim_substeps
+        self.sim_time = 0.0
+        self.n_env = n_env
+        # Optional per-environment generated trajectories (set later)
+        self.generated_trajectories = None
+        # Quadrant indices loaded from metadata (if available)
+        self.quadrant_indices = None
+        # Raw metadata for the selected cloth (set during mesh load)
+        self.mesh_metadata: Optional[dict] = None
+        # Optional override for cloth base position from config
+        self.base_position_override = base_position
+
+        #   contact (configurable)
+        #       body-cloth contact
+        self.cloth_body_contact_margin = float(_cfg("contact.cloth_body_contact_margin", 0.01))
+        #       self-contact
+        self.self_contact_radius = float(_cfg("contact.self_contact_radius", 0.002))
+        self.self_contact_margin = float(_cfg("contact.self_contact_margin", 0.003))
+
+        self.soft_contact_ke = float(_cfg("contact.soft_contact_ke", 100.0))
+        self.soft_contact_kd = float(_cfg("contact.soft_contact_kd", 2e-3))
+
+        self.robot_friction = float(_cfg("contact.robot_friction", 1.0))
+        self.table_friction = float(_cfg("contact.table_friction", 0.5))
+        self.self_contact_friction = float(_cfg("contact.self_contact_friction", 0.25))
+
+        self.scene = ModelBuilder()
+        self.soft_contact_max = 1000000
+
+        self.viewer = viewer
+        # Optional overrides for cloth library integration
+        self.mesh_file_override = mesh_file
+        self.z_rotation_override = z_rotation
+
+        # Control-related configurable parameters
+        self.gripper_open = float(_cfg("control.gripper_open", 0.8))
+        self.gripper_closed = float(_cfg("control.gripper_closed", 0.03))
+        offset_cfg = _cfg("control.endeffector_offset", [0.0, 0.0, 0.22])
+        if isinstance(offset_cfg, (list, tuple)) and len(offset_cfg) == 3:
+            self.endeff_vec = (float(offset_cfg[0]), float(offset_cfg[1]), float(offset_cfg[2]))
+        else:
+            self.endeff_vec = (0.0, 0.0, 0.22)
+        self.k_null = float(_cfg("control.k_null", 1.0))
+        self.gripper_scale = float(_cfg("control.gripper_scale", 0.04))
+        self.use_nullspace = bool(_cfg("control.use_nullspace", True))
+        self.include_rotation = bool(_cfg("control.include_rotation", True))
+        _max_qd = _cfg("control.max_joint_qd", None)
+        self.max_joint_qd = float(_max_qd) if _max_qd is not None else None
+        # Trajectory orientation configuration
+        dq_cfg = _cfg("trajectory.orientations.down_quat", [1.0, 0.0, 0.0, 0.0])
+        if isinstance(dq_cfg, (list, tuple)) and len(dq_cfg) == 4:
+            self.down_quat = (float(dq_cfg[0]), float(dq_cfg[1]), float(dq_cfg[2]), float(dq_cfg[3]))
+        else:
+            self.down_quat = (1.0, 0.0, 0.0, 0.0)
+        # Robot base transform configuration
+        self.robot_flip_about_xy = bool(_cfg("robot.flip_about_xy", True))
+        base_pos_cfg = _cfg("robot.base_position", [0.0, 0.0, 0.9])
+        if isinstance(base_pos_cfg, (list, tuple)) and len(base_pos_cfg) == 3:
+            self.robot_base_position = (float(base_pos_cfg[0]), float(base_pos_cfg[1]), float(base_pos_cfg[2]))
+        else:
+            self.robot_base_position = (0.0, 0.0, 0.9)
+
+        if self.add_robot:
+            franka = ModelBuilder()
+            self.create_articulation(franka)
+
+            self.scene.add_builder(franka)
+            self.bodies_per_env = franka.body_count
+            self.dof_q_per_env = franka.joint_coord_count
+            self.dof_qd_per_env = franka.joint_dof_count
+
+        # add a table (positioned in front of the robot at origin)
+        # Original: robot at (-0.5, -0.5), table at (0.0, -0.5) → 0.5m in front (X direction)
+        # Now: robot at (0, 0). Position and size are configurable via config.contact.*
+        table_hx = float(_cfg("contact.table_half_extent_x", 0.75))
+        table_hy = float(_cfg("contact.table_half_extent_y", 0.75))
+        table_hz = float(_cfg("contact.table_half_height", 0.1))
+        table_top_z = _cfg("contact.table_top_z", None)
+        center_z = (float(table_top_z) - table_hz) if (table_top_z is not None) else table_hz
+        table_x = float(_cfg("contact.table_pos_x", 0.5))
+        table_y = float(_cfg("contact.table_pos_y", 0.0))
+        self.scene.add_shape_box(
+            -1,
+            wp.transform(
+                wp.vec3(table_x, table_y, center_z),
+                wp.quat_identity(),
+            ),
+            hx=table_hx,
+            hy=table_hy,
+            hz=table_hz,
+        )
+
+    # add the cloth mesh
+        def load_and_process_mesh() -> Tuple[np.ndarray, np.ndarray]:
+            """
+            Load and process mesh file.
+            
+            Args:
+                mesh_file: Path to mesh file
+                input_scale_factor: Scale factor for mesh coordinates
+                
+            Returns:
+                Tuple of (vertices, indices) arrays
+            """
+            # Determine mesh file path: we require an explicit path from config/library (no fallback)
+            if self.mesh_file_override is not None:
+                mesh_file = self.mesh_file_override
+            else:
+                raise ValueError("mesh_file must be provided via config/library; no internal fallback is allowed")
+            if not os.path.exists(mesh_file):
+                raise FileNotFoundError(f"Mesh file not found: {mesh_file}")
+
+            # Attempt to read per-cloth metadata.json (orientation, center, downsampling)
+            meta = None
+            quadrant_indices = None
+            meta_path = os.path.join(os.path.dirname(mesh_file), "metadata.json")
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r") as f:
+                        meta = json.load(f)
+                    # keep around for placement/rotation usage
+                    self.mesh_metadata = meta
+                    # Load quadrant indices from separate file if referenced
+                    if meta and "quadrant_indices_file" in meta:
+                        indices_file = os.path.join(os.path.dirname(mesh_file), meta["quadrant_indices_file"])
+                        if os.path.isfile(indices_file):
+                            with open(indices_file, "r") as f:
+                                quadrant_indices = json.load(f)
+                except Exception:
+                    meta = None
+                    quadrant_indices = None
+
+            # Load mesh
+            mesh_data = trimesh.load_mesh(mesh_file)
+            mesh_points_np = mesh_data.vertices
+            faces_np = mesh_data.faces
+
+            # Swap axes from xzy to xyz if mesh is STL
+            if mesh_file.lower().endswith('.stl'):
+                mesh_points_np = mesh_points_np[:, [0, 2, 1]]  # swap y and z
+
+            # Runtime remeshing is disabled for data collection. Assume meshes are preprocessed.
+            # If metadata includes 'downsampling', it is informational only here.
+            
+            # Store quadrant indices for later use (trajectory seeding)
+            self.quadrant_indices = quadrant_indices
+            
+            # Scale mesh points
+            mesh_points = [v * 1.0 for v in mesh_points_np]
+            vertices_np = [wp.vec3(float(v[0]), float(v[1]), float(v[2])) for v in mesh_points]
+            indices_np = np.array(faces_np, dtype=np.int32).flatten()
+            
+            return vertices_np, indices_np
+
+    
+
+        vertices, mesh_indices = load_and_process_mesh()
+        
+        if self.add_cloth:
+            # Position cloth on the table in front of the robot
+            # Original: robot at (-0.5, -0.5), cloth at (0.0, -0.25) → 0.5m in front (X), 0.25m to side (Y)
+            # Now: robot at (0, 0), so cloth at (0.5, 0.25) to maintain same relative position
+            # Compose rotation exclusively from metadata/config
+            if self.mesh_metadata is None:
+                raise ValueError("Missing cloth metadata; cannot determine orientation")
+            orient = self.mesh_metadata.get("orientation", {})
+            base_rot_meta = orient.get("base_rotation", None)
+            if not base_rot_meta or "axis" not in base_rot_meta or "degrees" not in base_rot_meta:
+                raise ValueError("Metadata.orientation.base_rotation must provide 'axis' and 'degrees'")
+            axis = base_rot_meta["axis"]
+            deg = float(base_rot_meta["degrees"])
+            base_rot = wp.quat_from_axis_angle(wp.vec3(float(axis[0]), float(axis[1]), float(axis[2])), math.radians(deg))
+            print(f"Base rotation {base_rot}")
+
+            if self.z_rotation_override is not None:
+                z_rot_rad = float(self.z_rotation_override)
+            else:
+                if "default_z_rotation_degrees" not in orient:
+                    raise ValueError("No z-rotation override provided and metadata.orientation.default_z_rotation_degrees missing")
+                z_rot_rad = math.radians(float(orient["default_z_rotation_degrees"]))
+                print("Default rotation deg ")
+            print(f"Z rotation (rad) {z_rot_rad}")
+            if abs(z_rot_rad) > 1e-12:
+                rot_z = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), z_rot_rad)
+                # apply Z in world/table frame before base tilt
+                final_rot = rot_z * base_rot
+            else:
+                final_rot = base_rot
+
+            # Determine cloth placement exclusively from metadata/config
+            if self.base_position_override is not None:
+                cloth_pos = tuple(self.base_position_override)
+            else:
+                if "center_offset" not in self.mesh_metadata:
+                    raise ValueError("No base_position override provided and metadata.center_offset is missing")
+                co = self.mesh_metadata["center_offset"]
+                if not (isinstance(co, (list, tuple)) and len(co) == 3):
+                    raise ValueError("metadata.center_offset must be a length-3 list")
+                cloth_pos = (float(co[0]), float(co[1]), float(co[2]))
+
+            # expose base position for external consumers (e.g., trajectory generator)
+            self.cloth_base_pos = wp.vec3(*cloth_pos)
+            print(f"Final rotation {final_rot}")
+            print(f"Cloth base position {self.cloth_base_pos}")
+
+            # Load cloth parameters from metadata (required)
+            cp = self.mesh_metadata.get("cloth_parameters", None)
+            if not isinstance(cp, dict):
+                raise ValueError("metadata.cloth_parameters missing; add_cloth_mesh parameters must come from metadata")
+            required_keys = [
+                "density","scale","tri_ke","tri_ka","tri_kd","edge_ke","edge_kd","particle_radius"
+            ]
+            for k in required_keys:
+                if k not in cp:
+                    raise ValueError(f"metadata.cloth_parameters.{k} missing")
+
+            self.scene.add_cloth_mesh(
+                vertices=vertices,
+                indices=mesh_indices,
+                rot=final_rot,
+                pos=self.cloth_base_pos,
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                density=float(cp["density"]),
+                scale=float(cp["scale"]),
+                tri_ke=float(cp["tri_ke"]),
+                tri_ka=float(cp["tri_ka"]),
+                tri_kd=float(cp["tri_kd"]),
+                edge_ke=float(cp["edge_ke"]),
+                edge_kd=float(cp["edge_kd"]),
+                particle_radius=float(cp["particle_radius"]),
+            )
+
+            self.scene.color()
+
+
+        '''
+        Added parallel builder
+        '''
+        builder = newton.ModelBuilder()
+        
+        # Compute environment offsets (same logic as replicate uses internally)
+        spacing_cfg = _cfg("simulation.replicate_spacing", (3, 3, 0))
+        if isinstance(spacing_cfg, (list, tuple)) and len(spacing_cfg) == 3:
+            spacing = tuple(spacing_cfg)
+        else:
+            spacing = (3, 3, 0)
+
+        # Use the public newton.utils.compute_world_offsets function.
+        # This is the correct, portable way to get the offsets.
+        self.env_offsets = newton.utils.compute_world_offsets(self.n_env, spacing, builder.up_axis)
+        
+        # Manually add each environment using the calculated offsets
+        for i in range(self.n_env):
+            offset_vec = self.env_offsets[i]
+            xform = wp.transform(offset_vec, wp.quat_identity())
+            builder.add_builder(self.scene, xform=xform)
+        
+        builder.add_ground_plane()
+
+        self.model = builder.finalize(requires_grad=False)
+
+        self.model.soft_contact_ke = self.soft_contact_ke
+        self.model.soft_contact_kd = self.soft_contact_kd
+        self.model.soft_contact_mu = self.self_contact_friction
+
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        self.target_joint_qd = wp.empty_like(self.state_0.joint_qd)
+
+        self.control = self.model.control()
+        self.contacts = self.model.collide(self.state_0)
+
+        self.sim_time = 0.0
+
+        # initialize robot solver
+        self.robot_solver = SolverFeatherstone(self.model, update_mass_matrix_interval=self.sim_substeps)
+        self.set_up_control()
+
+        self.cloth_solver = None
+        if self.add_cloth:
+            # initialize cloth solver
+            #   set edge rest angle to zero to disable bending, this is currently a workaround to make SolverVBD stable
+            #   TODO: fix SolverVBD's bending issue
+            self.model.edge_rest_angle.zero_()
+            self.cloth_solver = SolverVBD(
+                self.model,
+                iterations=self.iterations,
+                self_contact_radius=self.self_contact_radius,
+                self_contact_margin=self.self_contact_margin,
+                handle_self_contact=True,
+                vertex_collision_buffer_pre_alloc=32,
+                edge_collision_buffer_pre_alloc=64,
+                integrate_with_external_rigid_solver=True,
+                collision_detection_interval=-1,
+            )
+
+        self.viewer.set_model(self.model)
+
+        # create Warp arrays for gravity so we can swap Model.gravity during
+        # a simulation running under CUDA graph capture
+        self.gravity_zero = wp.zeros(1, dtype=wp.vec3)  # used for the robot solver
+        # gravity in m/s^2 (vector configurable)
+        g_cfg = _cfg("simulation.gravity", None)
+        if isinstance(g_cfg, (list, tuple)) and len(g_cfg) == 3:
+            g_vec = wp.vec3(float(g_cfg[0]), float(g_cfg[1]), float(g_cfg[2]))
+        else:
+            g_vec = wp.vec3(0.0, 0.0, -9.81)
+        self.gravity_earth = wp.array(g_vec, dtype=wp.vec3)  # used for the cloth solver
+
+        # Ensure FK evaluation (for non-MuJoCo solvers):
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+
+        # graph capture
+        if self.add_cloth:
+            self.capture()
+
+    def set_generated_trajectories(self, traj_list):
+        """Enable per-environment generated trajectories.
+        traj_list: List of dicts with keys grasp_pos, lift_pos, drop_pos, grasp_time, lift_time, drop_time, total_time
+        Index in list must correspond to env_id.
+        """
+        self.generated_trajectories = traj_list
+
+    def set_up_control(self):
+        self.control = self.model.control()
+
+        # we are controlling the velocity
+        out_dim = 6
+        in_dim = self.model.joint_dof_count
+
+        def onehot(i, out_dim):
+            x = wp.array([1.0 if j == i else 0.0 for j in range(out_dim)], dtype=float)
+            return x
+
+        self.Jacobian_one_hots = [onehot(i, out_dim) for i in range(out_dim)]
+
+        # for robot control
+        self.delta_q = wp.empty(self.model.joint_count, dtype=float)
+        self.joint_q_des = wp.array(self.model.joint_q.numpy(), dtype=float)
+
+        # Pre-compile kernels for all end-effector body IDs to avoid repeated kernel compilation
+        self.compute_body_out_kernels = {}
+        for env_id in range(self.n_env):
+            ee_body_id = self.endeffector_id + env_id * self.bodies_per_env
+            
+            # Create a kernel for this specific end-effector using centralized factory
+            self.compute_body_out_kernels[ee_body_id] = dc_kernels.make_compute_body_out_kernel(
+                self.endeffector_offset, ee_body_id
+            )
+
+        # Keep the original kernel for backward compatibility (uses first end-effector)
+        self.compute_body_out_kernel = self.compute_body_out_kernels[self.endeffector_id]
+        
+        self.temp_state_for_jacobian = self.model.state(requires_grad=True)
+
+        self.body_out = wp.empty(out_dim, dtype=float, requires_grad=True)
+
+        self.J_flat = wp.empty(out_dim * in_dim, dtype=float)
+        self.J_shape = wp.array((out_dim, in_dim), dtype=int)
+        self.ee_delta = wp.empty(1, dtype=wp.spatial_vector)
+        self.initial_pose = self.model.joint_q.numpy()
+        # Buffer for current end-effector rotations per environment
+        self.ee_rotations = wp.empty(self.n_env, dtype=wp.quat)
+
+    def capture(self):
+        if wp.get_device().is_cuda:
+            with wp.ScopedCapture() as capture:
+                self.simulate()
+            self.graph = capture.graph
+        else:
+            self.graph = None
+
+    def create_articulation(self, builder):
+        asset_path = newton.utils.download_asset("franka_emika_panda")
+
+        # Define robot at origin (0, 0) so that all poses are naturally relative
+        # When replicate() is called, each environment gets its own offset automatically
+        builder.add_urdf(
+            str(asset_path / "urdf" / "fr3_franka_hand.urdf"),
+            xform=wp.transform(
+                self.robot_base_position,
+                (wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi) if self.robot_flip_about_xy else wp.quat_identity()),
+            ),
+            floating=False,
+            scale=1,  # unit: cm
+            enable_self_collisions=False,
+            collapse_fixed_joints=True,
+            force_show_colliders=False,
+        )
+        builder.joint_q[:6] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307]
+
+        clamp_close_activation_val = self.gripper_closed
+        clamp_open_activation_val = self.gripper_open
+
+        # Define poses relative to robot origin (0, 0, 0)
+        # With robot at (0,0) and table/cloth at (0.5, 0.0), adjust X by +0.5
+        # These poses are now relative offsets that will work for all environments
+        self.robot_key_poses = np.array(
+            [
+                # translation_duration, gripper transform (3D position, 4D quaternion), gripper open (1) or closed (0)
+                # top right
+                [2, 0.64, -0.075, 0.28, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [2,   0.64, -0.075, 0.21, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [2,   0.64, -0.075, 0.21, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [2,   0.57, -0.075, 0.31, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [3,  0.48, -0.075, 0.31, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [1,  0.48, -0.075, 0.31, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                # bottom right
+                [2,  0.59, 0.1275, 0.31, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [3,  0.59, 0.1275, 0.21, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [3,  0.59, 0.1275, 0.21, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [2,  0.59, 0.1275, 0.28, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [3, 0.48, 0.1275, 0.28, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [1, 0.48, 0.1275, 0.28, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                # top left
+                [2, 0.36, -0.075, 0.28, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [2, 0.36, -0.075, 0.20, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [2, 0.36, -0.075, 0.20, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [2, 0.43, -0.075, 0.31, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [3,  0.52, -0.075, 0.31, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [1,  0.52, -0.075, 0.31, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                # bottom left
+                [3, 0.41, 0.15, 0.205, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [3, 0.41, 0.15, 0.205, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [2, 0.49, 0.15, 0.31, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [3, 0.49, 0.15, 0.31, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [2, 0.49, 0.15, 0.31, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                # bottom
+                [2,   0.5, 0.21, 0.30, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [2,   0.5, 0.21, 0.20, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+                [2,   0.5, 0.21, 0.20, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [2,   0.5, 0.21, 0.35, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [1,   0.5, 0.12, 0.35, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [1.5, 0.5, 0.12, 0.35, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [1.5, 0.5, 0.05, 0.35, 1, 0.0, 0.0, 0.0, clamp_close_activation_val],
+                [1,   0.5, 0.05, 0.35, 1, 0.0, 0.0, 0.0, clamp_open_activation_val],
+            ],
+            dtype=np.float32,
+        )
+        self.targets = self.robot_key_poses[:, 1:]
+        self.transition_duration = self.robot_key_poses[:, 0]
+        self.target = self.targets[0]
+
+        self.robot_key_poses_time = np.cumsum(self.robot_key_poses[:, 0])
+        self.endeffector_id = builder.body_count - 3
+        self.endeffector_offset = wp.transform(self.endeff_vec, wp.quat_identity())
+
+    def compute_body_jacobian(
+        self,
+        model: Model,
+        joint_q: wp.array,
+        joint_qd: wp.array,
+        include_rotation: bool = False,
+    ):
+        """
+        Compute the Jacobian of the end effector's velocity related to joint_q
+        Uses the fixed self.endeffector_id (for backward compatibility)
+        """
+        return self.compute_body_jacobian_for_env(
+            model, joint_q, joint_qd, self.endeffector_id, include_rotation
+        )
+
+    def compute_body_jacobian_for_env(
+        self,
+        model: Model,
+        joint_q: wp.array,
+        joint_qd: wp.array,
+        body_id: int,
+        include_rotation: bool = False,
+    ):
+        """
+        Compute the Jacobian of a specific body's velocity related to joint_q
+        This version accepts body_id as a parameter for multi-environment support
+        Uses pre-compiled kernels for efficiency
+        """
+
+        joint_q.requires_grad = True
+        joint_qd.requires_grad = True
+
+        in_dim = model.joint_dof_count
+        out_dim = 6 if include_rotation else 3
+
+        # Use the pre-compiled kernel for this body_id
+        compute_body_out = self.compute_body_out_kernels[body_id]
+
+        tape = wp.Tape()
+        with tape:
+            eval_fk(model, joint_q, joint_qd, self.temp_state_for_jacobian)
+            wp.launch(
+                compute_body_out, 1, inputs=[self.temp_state_for_jacobian.body_qd], outputs=[self.body_out]
+            )
+
+        for i in range(out_dim):
+            tape.backward(grads={self.body_out: self.Jacobian_one_hots[i]})
+            wp.copy(self.J_flat[i * in_dim : (i + 1) * in_dim], joint_qd.grad)
+            tape.zero()
+
+    def generate_control_joint_qd(
+        self,
+        state_in: State,
+    ):
+        t_mod = (
+            self.sim_time
+            if self.sim_time < self.robot_key_poses_time[-1]
+            else self.sim_time % self.robot_key_poses_time[-1]
+        )
+        include_rotation = self.include_rotation
+        current_interval = np.searchsorted(self.robot_key_poses_time, t_mod)
+
+        # Get all joint states as numpy array once
+        all_joint_q = state_in.joint_q.numpy()
+        all_joint_qd = state_in.joint_qd.numpy()
+        
+        # CRITICAL FIX #1: Read target_qd array ONCE before the loop to avoid overwriting
+        target_qd_np = self.target_joint_qd.numpy()
+        
+        # Orientation policy: keep a fixed orientation for the entire trajectory (from config)
+        # We still compute position targets per phase below.
+
+        # Compute control for each environment separately
+        for env_id in range(self.n_env):
+            # Get the offset for this environment
+            env_offset = self.env_offsets[env_id]
+            
+            # Determine per-env target (position, orientation, gripper)
+            if self.generated_trajectories is not None:
+                traj = self.generated_trajectories[env_id]
+                # Segment durations
+                g = float(traj["grasp_time"])      # move: lift -> grasp (descent)
+                gd = float(traj.get("grasp_dwell", 0.0))  # dwell at grasp
+                l = float(traj["lift_time"])       # move: grasp -> lift (ascend)
+                d = float(traj["drop_time"])       # move: lift -> drop (transport)
+                dd = float(traj.get("drop_dwell", 0.0))   # dwell at drop
+                # Total time
+                if "total_time" in traj:
+                    T = float(traj["total_time"])
+                else:
+                    T = float(g + gd + l + d + dd)
+                tloc = (self.sim_time % T) if T > 1e-6 else 0.0
+                # Waypoints (support explicit pre/post if provided)
+                grasp = np.asarray(traj.get("grasp_pos", traj.get("post_grasp_pos")), dtype=np.float32)
+                pre_grasp = np.asarray(traj.get("pre_grasp_pos", grasp), dtype=np.float32)
+                post_grasp = np.asarray(traj.get("post_grasp_pos", grasp), dtype=np.float32)
+                lift = np.asarray(traj["lift_pos"], dtype=np.float32)
+                drop = np.asarray(traj.get("drop_pos", traj.get("pre_drop_pos")), dtype=np.float32)
+                pre_drop = np.asarray(traj.get("pre_drop_pos", drop), dtype=np.float32)
+                post_drop = np.asarray(traj.get("post_drop_pos", drop), dtype=np.float32)
+                # Phase boundaries: [0, g) descend; [g, g+gd) grasp dwell; [g+gd, g+gd+l) ascend;
+                # [g+gd+l, g+gd+l+d) transport; [g+gd+l+d, T) drop dwell
+                t1 = g
+                t2 = g + gd
+                t3 = t2 + l
+                t4 = t3 + d
+                if tloc < t1:
+                    # Descend: move from lift to pre-grasp, gripper open
+                    a = (tloc / g) if g > 1e-6 else 1.0
+                    p = lift * (1.0 - a) + pre_grasp * a
+                    grip = 0.8  # open
+                elif tloc < t2:
+                    # Grasp dwell: at post-grasp, transition to closed
+                    p = post_grasp
+                    grip = 0.03  # closed
+                elif tloc < t3:
+                    # Ascend: move from grasp back to lift, gripper closed
+                    a = ((tloc - t2) / l) if l > 1e-6 else 1.0
+                    p = post_grasp * (1.0 - a) + lift * a
+                    grip = 0.03  # closed
+                elif tloc < t4:
+                    # Transport: move from lift to drop, gripper closed
+                    a = ((tloc - t3) / d) if d > 1e-6 else 1.0
+                    p = lift * (1.0 - a) + pre_drop * a
+                    grip = 0.03  # closed
+                else:
+                    # Drop dwell: at post-drop, gripper open
+                    p = post_drop
+                    grip = 0.8  # open
+                # positions from generator are absolute world; no extra env offset
+                target_pos = wp.vec3(float(p[0]), float(p[1]), float(p[2]))
+                # Keep the same orientation for the entire trajectory: use the configured "down" quaternion
+                dq = self.down_quat
+                target_quat = wp.quat(float(dq[0]), float(dq[1]), float(dq[2]), float(dq[3]))
+                target_grip = grip
+            else:
+                # Create target transform with environment offset applied using built-in key poses
+                target_pos = wp.vec3(
+                    self.targets[current_interval][0] + env_offset[0],
+                    self.targets[current_interval][1] + env_offset[1],
+                    self.targets[current_interval][2] + env_offset[2],
+                )
+                target_quat = wp.quat(*self.targets[current_interval][3:7])
+                target_grip = float(self.targets[current_interval][-1])
+
+            target_transform = wp.transform(target_pos, target_quat)
+            
+            # Extract this environment's joint states
+            q_start = env_id * self.dof_q_per_env
+            q_end = q_start + self.dof_q_per_env
+            qd_start = env_id * self.dof_qd_per_env
+            qd_end = qd_start + self.dof_qd_per_env
+            
+            q = all_joint_q[q_start:q_end]
+            qd = all_joint_qd[qd_start:qd_end]
+            
+            # CRITICAL FIX #2: Compute end-effector error for THIS environment's end-effector
+            # The end-effector body ID needs to account for environment offset
+            ee_body_id = self.endeffector_id + env_id * self.bodies_per_env
+            
+            wp.launch(
+                dc_kernels.compute_ee_delta,
+                dim=1,
+                inputs=[
+                    state_in.body_q,
+                    self.endeffector_offset,
+                    ee_body_id,  # Use the correct end-effector for this environment
+                    target_transform,
+                ],
+                outputs=[self.ee_delta],
+            )
+            
+            delta_target = self.ee_delta.numpy()[0]
+
+            # CRITICAL FIX #3: Compute Jacobian for THIS environment's end-effector
+            # We need to pass the correct body_id for this environment
+            self.compute_body_jacobian_for_env(
+                self.model,
+                state_in.joint_q,
+                state_in.joint_qd,
+                ee_body_id,
+                include_rotation=include_rotation,
+            )
+            
+            # Extract Jacobian columns for this environment only
+            J_full = self.J_flat.numpy().reshape(-1, self.model.joint_dof_count)
+            J = J_full[:, qd_start:qd_end]  # Get only this environment's DOF columns
+            
+            J_inv = np.linalg.pinv(J)
+
+            if self.use_nullspace:
+                # 2. Compute null-space projector
+                #    I is size [num_joints x num_joints] for THIS environment
+                I = np.eye(J.shape[1], dtype=np.float32)
+                N = I - J_inv @ J
+
+                # 3. Define a desired "elbow-up" reference posture for this environment
+                q_des = q.copy()
+                # Extract this environment's portion of the initial pose
+                initial_pose_for_env = self.initial_pose[q_start:q_end]
+                q_des[1:] = initial_pose_for_env[1:]  # keep joints near initial safe pose
+
+                # 4. Define a null-space velocity term pulling joints toward q_des
+                delta_q_null = self.k_null * (q_des - q)
+
+                # 5. Combine primary task and null-space controller
+                delta_q = J_inv @ delta_target + N @ delta_q_null
+            else:
+                delta_q = J_inv @ delta_target
+
+            # Apply gripper finger control
+            delta_q[-2] = target_grip * self.gripper_scale - q[-2]
+            delta_q[-1] = target_grip * self.gripper_scale - q[-1]
+
+            # Optional clamp on joint velocities for stability/safety
+            if self.max_joint_qd is not None and np.isfinite(self.max_joint_qd):
+                delta_q = np.clip(delta_q, -self.max_joint_qd, self.max_joint_qd)
+
+            # CRITICAL FIX #1 (continued): Update the shared array for this environment
+            target_qd_np[qd_start:qd_end] = delta_q
+        
+        # CRITICAL FIX #1 (final): Assign the full array ONCE after all environments are computed
+        self.target_joint_qd.assign(target_qd_np)
+
+    def step(self):
+        self.generate_control_joint_qd(self.state_0)
+        if self.graph:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+
+        self.sim_time += self.frame_dt
+
+    def simulate(self):
+        self.cloth_solver.rebuild_bvh(self.state_0)
+        for _step in range(self.sim_substeps):
+            # robot sim
+            self.state_0.clear_forces()
+            self.state_1.clear_forces()
+
+            # apply forces to the model for picking, wind, etc
+            self.viewer.apply_forces(self.state_0)
+
+            if self.add_robot:
+                particle_count = self.model.particle_count
+                # set particle_count = 0 to disable particle simulation in robot solver
+                self.model.particle_count = 0
+                self.model.gravity.assign(self.gravity_zero)
+
+                # Update the robot pose - this will modify state_0 and copy to state_1
+                self.model.shape_contact_pair_count = 0
+
+                self.state_0.joint_qd.assign(self.target_joint_qd)
+                # Just update the forward kinematics to get body positions from joint coordinates
+                self.robot_solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
+
+                self.state_0.particle_f.zero_()
+
+                # restore original settings
+                self.model.particle_count = particle_count
+                self.model.gravity.assign(self.gravity_earth)
+
+            # cloth sim
+            self.contacts = self.model.collide(self.state_0, soft_contact_margin=self.cloth_body_contact_margin)
+
+            if self.add_cloth:
+                self.cloth_solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+
+            self.state_0, self.state_1 = self.state_1, self.state_0
+
+            self.sim_time += self.sim_dt
+
+    def render(self):
+        if self.viewer is None:
+            return
+
+        use_rerun = False
+
+        if use_rerun:
+            self.viewer = newton.viewer.ViewerRerun(
+                server=True,                    # Start in server mode
+                address="127.0.0.1:9876",      # Server address
+                launch_viewer=True,            # Auto-launch web viewer
+                app_id="newton-simulation"     # Application identifier
+            )
+
+            self.viewer.set_model(self.model)
+
+        self.viewer.begin_frame(self.sim_time)
+        self.viewer.log_state(self.state_0)
+        self.viewer.end_frame()
+
+
+
+    def test(self):
+        p_lower = wp.vec3(-0.34, -0.9, 0.0)
+        p_upper = wp.vec3(0.34, 0.0, 0.51)
+        newton.examples.test_particle_state(
+            self.state_0,
+            "particles are within a reasonable volume",
+            lambda q, qd: newton.utils.vec_inside_limits(q, p_lower, p_upper),
+        )
+        newton.examples.test_particle_state(
+            self.state_0,
+            "particle velocities are within a reasonable range",
+            lambda q, qd: max(abs(qd)) < 2.0,
+        )
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "body velocities are within a reasonable range",
+            lambda q, qd: max(abs(qd)) < 0.7,
+        )
+
+    def reset(self):
+        """Reset the simulation to its initial state."""
+        self.sim_time = 0.0
+        
+        # Reset states to initial configuration
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        
+        # Reset control and contacts
+        self.control = self.model.control()
+        self.contacts = self.model.collide(self.state_0)
+        
+        # Reset robot to initial joint configuration
+        if self.add_robot:
+            # Re-evaluate forward kinematics with initial joint positions
+            newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        
+        # Recapture CUDA graph if needed
+        if self.add_cloth:
+            self.capture()
+
+    # removed run_iteration and run methods; this example is imported and stepped externally
+                
+if __name__ == "__main__":
+    # Intentionally left empty: this module is now imported and driven externally.
+    pass
+</file>
+
+<file path="cloth_preprocessing/__init__.py">
+# Package marker for cloth_preprocessing tools
+</file>
+
+<file path="cloth_preprocessing/generate_cloth_metadata.py">
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import argparse
+from typing import Dict, List
+
+import numpy as np
+
+DEFAULT_BASE_ROT_AXIS = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+DEFAULT_BASE_ROT_DEG = 90.0
+DEFAULT_Z_ROT_DEG = 0.0
+DEFAULT_CENTER_OFFSET = [0.5, 0.25, 0.25]
+DEFAULT_REMESH_PERCENT = 0.65  # consumed by preprocessing script
+DEFAULT_CLOTH_PARAMS = {
+    "density": 0.2,
+    "scale": 1.0,
+    "tri_ke": 1e2,
+    "tri_ka": 1e2,
+    "tri_kd": 1.5e-6,
+    "edge_ke": 1e-4,
+    "edge_kd": 1e-3,
+    "particle_radius": 0.006,
+}
+
+
+def _mesh_candidates(folder: Path) -> List[Path]:
+    return list(folder.glob("*.obj")) + list(folder.glob("*.stl"))
+
+
+def _load_metadata(path: Path) -> Dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _merge_defaults(meta: Dict, folder: Path) -> Dict:
+    meta = dict(meta) if meta else {}
+    # Set source_mesh_file if missing
+    if "source_mesh_file" not in meta:
+        candidates = _mesh_candidates(folder)
+        if candidates:
+            meta["source_mesh_file"] = candidates[0].name
+    # Orientation defaults
+    if "orientation" not in meta or not isinstance(meta.get("orientation"), dict):
+        meta["orientation"] = {}
+    ori = meta["orientation"]
+    if "base_rotation" not in ori or not isinstance(ori.get("base_rotation"), dict):
+        ori["base_rotation"] = {"axis": DEFAULT_BASE_ROT_AXIS.tolist(), "degrees": DEFAULT_BASE_ROT_DEG}
+    if "default_z_rotation_degrees" not in ori:
+        ori["default_z_rotation_degrees"] = DEFAULT_Z_ROT_DEG
+    # Placement hint
+    if "center_offset" not in meta:
+        meta["center_offset"] = DEFAULT_CENTER_OFFSET
+    # Downsampling defaults for preprocessing to consume later
+    if "downsampling" not in meta or not isinstance(meta.get("downsampling"), dict):
+        meta["downsampling"] = {
+            "perform_remeshing": True,
+            "method": "isotropic_explicit_remeshing",
+            "edge_length_percentage": DEFAULT_REMESH_PERCENT,
+        }
+    else:
+        ds = meta["downsampling"]
+        ds.setdefault("perform_remeshing", True)
+        ds.setdefault("method", "isotropic_explicit_remeshing")
+        ds.setdefault("edge_length_percentage", DEFAULT_REMESH_PERCENT)
+    # Cloth physical parameters
+    if "cloth_parameters" not in meta or not isinstance(meta.get("cloth_parameters"), dict):
+        meta["cloth_parameters"] = DEFAULT_CLOTH_PARAMS
+    else:
+        for k, v in DEFAULT_CLOTH_PARAMS.items():
+            meta["cloth_parameters"].setdefault(k, v)
+    return meta
+
+
+def write_metadata_for_folder(folder: Path, overwrite: bool = False) -> None:
+    meta_path = folder / "metadata.json"
+    existing = {} if overwrite else _load_metadata(meta_path)
+    merged = _merge_defaults(existing, folder)
+    meta_path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+    print(f"[ok] Wrote {meta_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Populate cloth metadata (no preprocessing)")
+    parser.add_argument("--assets-root", type=str, default=str(Path(__file__).parent / "assets"), help="Path to assets root directory")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite metadata.json instead of merging defaults")
+    args = parser.parse_args()
+
+    assets_root = Path(args.assets_root)
+    if not assets_root.exists():
+        print(f"Assets root not found: {assets_root}")
+        return
+
+    for sub in sorted(assets_root.iterdir()):
+        if sub.is_dir():
+            write_metadata_for_folder(sub, overwrite=args.overwrite)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="cloth_preprocessing/preprocess_cloth_assets.py">
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+import argparse
+from typing import Dict, List
+
+import numpy as np
+import trimesh
+import pymeshlab
+
+try:
+    import open3d as o3d  # type: ignore
+    _HAS_O3D = True
+except Exception:
+    _HAS_O3D = False
+
+DEFAULT_OUTPUT_MESH_NAME = "mesh_centered_remeshed.obj"
+
+
+def axis_angle_quat(axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    axis = np.asarray(axis, dtype=np.float32)
+    axis = axis / (np.linalg.norm(axis) + 1e-9)
+    s = math.sin(angle_rad / 2.0)
+    w = math.cos(angle_rad / 2.0)
+    x, y, z = axis * s
+    return np.array([x, y, z, w], dtype=np.float32)
+
+
+def rotate_points(points: np.ndarray, quat_xyzw: np.ndarray) -> np.ndarray:
+    q = quat_xyzw
+    w = q[3]
+    x, y, z = q[0], q[1], q[2]
+    R = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float32)
+    return (R @ points.T).T
+
+
+def compute_quadrant_indices(verts: np.ndarray, keep_ratio: float = 0.1) -> Dict[str, List[int]]:
+    xy = verts[:, :2]
+    cx, cy = np.median(xy[:, 0]), np.median(xy[:, 1])
+    N = verts.shape[0]
+    k = max(1, int(keep_ratio * N))
+    d2 = (xy[:, 0] - cx) ** 2 + (xy[:, 1] - cy) ** 2
+
+    def top_left_mask():
+        return (xy[:, 0] < cx) & (xy[:, 1] >= cy)
+
+    def top_right_mask():
+        return (xy[:, 0] >= cx) & (xy[:, 1] >= cy)
+
+    def bottom_left_mask():
+        return (xy[:, 0] < cx) & (xy[:, 1] < cy)
+
+    def bottom_right_mask():
+        return (xy[:, 0] >= cx) & (xy[:, 1] < cy)
+
+    out: Dict[str, List[int]] = {}
+    for name, mask_fn in [
+        ("top_left", top_left_mask),
+        ("top_right", top_right_mask),
+        ("bottom_left", bottom_left_mask),
+        ("bottom_right", bottom_right_mask),
+    ]:
+        mask = mask_fn()
+        idx = np.nonzero(mask)[0]
+        if idx.size <= k:
+            chosen = idx
+        else:
+            order = np.argsort(-d2[idx])
+            chosen = idx[order[:k]]
+        out[name] = [int(i) for i in chosen.tolist()]
+    return out
+
+
+def remesh(vertices: np.ndarray, faces: np.ndarray, percent: float) -> tuple[np.ndarray, np.ndarray]:
+    ms = pymeshlab.MeshSet()
+    ms.add_mesh(pymeshlab.Mesh(vertex_matrix=vertices, face_matrix=faces))
+    ms.meshing_isotropic_explicit_remeshing(targetlen=pymeshlab.PercentageValue(percent))
+    m = ms.current_mesh()
+    return m.vertex_matrix(), m.face_matrix()
+
+
+essential_keys = [
+    ("source_mesh_file", None),
+    ("orientation.base_rotation.axis", None),
+    ("orientation.base_rotation.degrees", None),
+    ("downsampling.perform_remeshing", True),
+    ("downsampling.edge_length_percentage", None),
+]
+
+
+def _get_meta_val(meta: Dict, dotted: str):
+    cur = meta
+    for part in dotted.split('.'):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def validate_metadata(meta: Dict, folder: Path) -> tuple[bool, str]:
+    # Ensure essential fields exist and are valid
+    for key, required_val in essential_keys:
+        val = _get_meta_val(meta, key)
+        if val is None:
+            return False, f"Missing metadata field: {key}"
+        if required_val is not None and val != required_val:
+            return False, f"Metadata field {key} must be {required_val}, got {val}"
+    # Check source mesh exists
+    src = folder / str(_get_meta_val(meta, "source_mesh_file"))
+    if not src.exists():
+        return False, f"Source mesh not found: {src}"
+    return True, "OK"
+
+
+def preprocess_folder(folder: Path, visualize: bool = False) -> None:
+    meta_path = folder / "metadata.json"
+    if not meta_path.exists():
+        print(f"[skip] No metadata.json in {folder}")
+        return
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        print(f"[skip] Cannot parse metadata: {meta_path}")
+        return
+
+    ok, reason = validate_metadata(meta, folder)
+    if not ok:
+        print(f"[skip] {folder.name}: {reason}")
+        return
+
+    # Load source mesh
+    mesh_path = folder / str(meta["source_mesh_file"])
+    mesh = trimesh.load_mesh(str(mesh_path))
+    V = np.asarray(mesh.vertices, dtype=np.float32)
+    F = np.asarray(mesh.faces, dtype=np.int32)
+
+    # STL axis swap
+    if mesh_path.suffix.lower() == ".stl":
+        V = V[:, [0, 2, 1]]
+
+    # Remesh using metadata percentage
+    percent = float(meta["downsampling"]["edge_length_percentage"])
+    V_rm, F_rm = remesh(V, F, percent)
+    V_rm = V_rm.astype(np.float32)
+    F_rm = F_rm.astype(np.int32)
+
+    # Center by centroid
+    centroid = np.mean(V_rm, axis=0, dtype=np.float32)
+    V_centered = (V_rm - centroid).astype(np.float32)
+
+    # Compute laid-flat vertices using metadata base rotation
+    base = meta["orientation"]["base_rotation"]
+    axis = np.asarray(base["axis"], dtype=np.float32)
+    deg = float(base["degrees"])
+    qx = axis_angle_quat(axis, math.radians(deg))
+    V_flat = rotate_points(V_centered, qx)
+
+    # Quadrants
+    quadrants = compute_quadrant_indices(V_flat, keep_ratio=0.5)
+
+    # Save centered+remeshed OBJ
+    out_mesh_path = folder / DEFAULT_OUTPUT_MESH_NAME
+    tm = trimesh.Trimesh(vertices=V_centered, faces=F_rm, process=False)
+    tm.export(out_mesh_path)
+    print(f"[ok] Wrote {out_mesh_path}")
+
+    # Save indices
+    indices_filename = "quadrant_indices.json"
+    with open(folder / indices_filename, "w") as f:
+        json.dump(quadrants, f, indent=2)
+    print(f"[ok] Wrote {folder / indices_filename}")
+
+    # Update metadata (do not overwrite user-provided cloth parameters)
+    meta["mesh_file"] = out_mesh_path.name
+    meta["quadrant_indices_file"] = indices_filename
+    meta["vertex_count"] = int(V_centered.shape[0])
+    preproc = meta.get("preprocessed", {}) if isinstance(meta.get("preprocessed", {}), dict) else {}
+    preproc.update({"centered": True, "remeshed": True})
+    meta["preprocessed"] = preproc
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"[ok] Updated {meta_path}")
+
+    # Optional visualization
+    if visualize:
+        try:
+            if _HAS_O3D:
+                _visualize_o3d(V_flat, F_rm, quadrants)
+            else:
+                _visualize_trimesh(V_flat, F_rm, quadrants)
+        except Exception as e:
+            print(f"[warn] Visualization failed for {folder.name}: {e}")
+
+
+def _visualize_trimesh(V: np.ndarray, F: np.ndarray, quadrants: Dict[str, List[int]]) -> None:
+    colors = np.tile(np.array([180, 180, 200, 255], dtype=np.uint8), (V.shape[0], 1))
+    palette = {
+        "top_left": np.array([255, 0, 0, 255], dtype=np.uint8),
+        "top_right": np.array([0, 255, 0, 255], dtype=np.uint8),
+        "bottom_left": np.array([0, 0, 255, 255], dtype=np.uint8),
+        "bottom_right": np.array([255, 165, 0, 255], dtype=np.uint8),
+    }
+    for name, idxs in quadrants.items():
+        if name in palette:
+            colors[np.asarray(idxs, dtype=np.int32)] = palette[name]
+    m = trimesh.Trimesh(vertices=V, faces=F, process=False)
+    m.visual.vertex_colors = colors
+    m.show()
+
+
+def _visualize_o3d(V: np.ndarray, F: np.ndarray, quadrants: Dict[str, List[int]]) -> None:
+    mesh_o3d = o3d.geometry.TriangleMesh(
+        vertices=o3d.utility.Vector3dVector(V.astype(np.float64)),
+        triangles=o3d.utility.Vector3iVector(F.astype(np.int32)),
+    )
+    mesh_o3d.compute_vertex_normals()
+    base_color = np.tile(np.array([[0.7, 0.7, 0.8]], dtype=np.float64), (V.shape[0], 1))
+    palette = {
+        "top_left": np.array([1.0, 0.0, 0.0]),
+        "top_right": np.array([0.0, 1.0, 0.0]),
+        "bottom_left": np.array([0.0, 0.0, 1.0]),
+        "bottom_right": np.array([1.0, 0.65, 0.0]),
+    }
+    for name, idxs in quadrants.items():
+        if name in palette and len(idxs) > 0:
+            base_color[np.asarray(idxs, dtype=np.int32), :] = palette[name]
+    mesh_o3d.vertex_colors = o3d.utility.Vector3dVector(base_color)
+    o3d.visualization.draw_geometries([mesh_o3d])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Preprocess cloth assets (center+remesh, quadrants)")
+    print(str(Path(__file__).parent.parent / "assets"))
+    parser.add_argument("--assets-root", type=str, default=str(Path(__file__).parent.parent / "assets"), help="Path to assets root directory (defaults to ../assets relative to this file)")
+    parser.add_argument("--visualize", action="store_true", help="Visualize quadrant vertices after preprocessing")
+    args = parser.parse_args()
+
+    assets_root = Path(args.assets_root)
+    if not assets_root.exists():
+        print(f"Assets root not found: {assets_root}")
+        return
+
+    for sub in sorted(assets_root.iterdir()):
+        if sub.is_dir():
+            preprocess_folder(sub, visualize=args.visualize)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="cloth_preprocessing/README.md">
+# Cloth Preprocessing and Dataset Preparation
+
+This folder contains the tools and docs for preparing cloth assets for the dataset pipeline.
+
+- Populate per-cloth `metadata.json` with orientation, center offset, downsampling, and cloth parameters
+- Preprocess meshes (center + remesh) and compute quadrant indices with optional visualization
+- Output a preprocessed OBJ, `quadrant_indices.json`, and updated `metadata.json`
+
+## 📁 Cloth Library Setup
+
+### Directory Structure
+
+```
+assets/
+├── cloth_type_01/
+│   ├── mesh.obj          # or mesh.stl
+│   └── metadata.json     # optional initially; created/updated by metadata script
+├── cloth_type_02/
+│   ├── mesh.obj
+│   └── metadata.json
+└── ...
+```
+
+### metadata.json (example)
+
+```json
+{
+  "name": "T-shirt Large",
+  "category": "garment",
+  "properties": {
+    "size": "large",
+    "material": "cotton"
+  }
+}
+```
+
+The system will:
+- Randomly select a cloth mesh per iteration
+- Apply random Z-rotation (if `randomize_orientation: true`)
+- Use the same mesh across all environments within that iteration (if configured)
+- Automatically handle `.obj` and `.stl` formats
+
+## 🧵 Preprocessing workflow (metadata split)
+
+Cloth preparation is a two-step process:
+
+1) Populate metadata only
+- Fills or merges defaults into `metadata.json` in each cloth folder, including:
+  - `orientation.base_rotation.axis/degrees`
+  - `orientation.default_z_rotation_degrees`
+  - `center_offset`
+  - `downsampling` settings for later remeshing (informational)
+  - `cloth_parameters` (density, stiffness, radius, etc.) used at runtime by the environment
+- If `source_mesh_file` is missing, it will be inferred from the first `.obj`/`.stl` in the folder.
+
+2) Preprocess assets (center + remesh + quadrants)
+- Requires `metadata.json` to already exist with the fields above.
+- Produces a centered, remeshed mesh (OBJ) and writes `quadrant_indices.json`.
+- Updates `metadata.json` with:
+  - `mesh_file` (the new centered+remeshed asset)
+  - `preprocessed` flags
+  - `quadrant_indices_file` reference
+- Optional visualization is available during preprocessing to colorize quadrant samples.
+
+At runtime, the environment assumes meshes are preprocessed and reads cloth parameters and orientation exclusively from `metadata.json` or the run config—there are no internal defaults.
+
+## ▶️ How to run
+
+PowerShell examples:
+
+```powershell
+# 1) Populate or merge metadata defaults
+python -m newton.examples.cloth.data_collection.cloth_preprocessing.generate_cloth_metadata --assets-root c:/path/to/assets
+
+# Optional: overwrite existing metadata.json entirely with defaults (then edit by hand)
+python -m newton.examples.cloth.data_collection.cloth_preprocessing.generate_cloth_metadata --assets-root c:/path/to/assets --overwrite
+
+# 2) Preprocess assets (center + remesh + compute quadrants)
+python -m newton.examples.cloth.data_collection.cloth_preprocessing.preprocess_cloth_assets --assets-root c:/path/to/assets
+
+# Optional visualization during preprocessing
+python -m newton.examples.cloth.data_collection.cloth_preprocessing.preprocess_cloth_assets --assets-root c:/path/to/assets --visualize
+```
+
+## Notes
+
+- The `downsampling.edge_length_percentage` value in metadata is consumed by preprocessing for remeshing.
+- STL axes are adjusted (Y/Z swapped) before preprocessing to match the runtime coordinate system.
+- `cloth_parameters` are used by the simulation when creating the cloth (no runtime remeshing is performed).
+</file>
+
+<file path="config.json">
+{
+  "simulation": {
+    "n_env": 1,
+    "iterations": 10,
+    "num_frames": 1000,
+    "seed": 42,
+    "save_interval": 1,
+    "viewer": "gl",
+    "device": "cuda:0",
+    
+    "add_cloth": true,
+    "add_robot": true,
+    "fps": 60,
+    "sim_substeps": 15,
+    "replicate_spacing": [3, 3, 0],
+    "gravity": [0.0, 0.0, -9.81]
+  },
+  "paths": {
+    "out_dir": "output",
+    "cloth_library_dir": "assets",
+    "mesh_file": null
+  },
+  "cloth": {
+    "source": "library",
+    "orientation": {
+      "use_default": false,
+      "sampling_degrees": [-180, 180]
+    },
+    "keep_flat": true,
+    "use_same_mesh_per_env": true,
+    "base_position": [0.5, 0.25, 0.25],
+    
+    "solver_iterations": 5
+  },
+  "trajectory": {
+    "position_noise_std": 0.02,
+    "timing_noise_std": 0.1,
+    "grasp_height": 0.185,
+    "lift_height": 0.5,
+    "drop_offset_range": [-0.15, 0.15],
+    "cloth_extent_m": 0.4,
+    "timing": {
+      "grasp_dwell": 1.5,
+      "drop_dwell": 1.5
+    },
+    "orientations": {
+      "down_quat": [1.0, 0.0, 0.0, 0.0]
+    }
+  },
+  "data_collection": {
+    "grasp_offset_steps": 5,
+    "release_offset_steps": 5,
+    "point_sample_rate": 1000,
+    "camera": {
+      "position": [0.5, 0.0, 2.0],
+      "direction": [0.0, 0.0, -1.0],
+      "grid": 256
+    }
+  },
+  "contact": {
+    "table_top_z": 0.20,
+    "ee_radius": 0.035,
+    "table_margin": 0.003,
+    
+    "cloth_body_contact_margin": 0.01,
+    "self_contact_radius": 0.002,
+    "self_contact_margin": 0.003,
+    "soft_contact_ke": 100.0,
+    "soft_contact_kd": 0.002,
+    "robot_friction": 1.0,
+    "table_friction": 0.5,
+    "self_contact_friction": 0.25,
+    "table_half_extent_x": 0.65,
+    "table_half_extent_y": 0.65,
+    "table_half_height": 0.1,
+    "table_pos_x": 0.5,
+    "table_pos_y": 0.0
+  },
+  "control": {
+    "gripper_open": 0.8,
+    "gripper_closed": 0.03,
+    "endeffector_offset": [0.0, 0.0, 0.22],
+    "k_null": 1.0,
+    "gripper_scale": 0.04,
+    "use_nullspace": true,
+    "include_rotation": true,
+    "max_joint_qd": 2.0
+  },
+  "robot": {
+    "flip_about_xy": false,
+    "base_position": [-0.25, 0.0, 0.0]
+  }
+}
+</file>
+
+<file path="data_collector.py">
+"""
+Data collection utilities: mesh sampling, point cloud projection, and timestep buffering.
+Saves one file per iteration; can optionally trigger USD/binary viewer output upstream.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import numpy as np
+
+
+@dataclass
+class DataCollectionConfig:
+    """Config for collecting data with offsets around grasp/release events."""
+
+    grasp_offset_steps: int = 5      # Start collecting N steps after grasp
+    release_offset_steps: int = 5    # Stop collecting N steps after release
+    camera_position: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.0, 2.0], dtype=np.float32))
+    camera_direction: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, -1.0], dtype=np.float32))
+    point_sample_count: int = 1000   # Number of points to sample from cloth mesh
+    grid: int = 256                  # Z-buffer grid resolution for occlusion
+    save_interval: int = 1           # Save every N simulation steps
+
+
+class PointCloudProjector:
+    """
+    Projects 3D points to a plane normal to camera_direction, simulating occlusion
+    via a simple z-buffer (closest points kept per 2D pixel bin).
+    """
+
+    def __init__(self, camera_position: np.ndarray, camera_direction: np.ndarray):
+        cp = np.asarray(camera_position, dtype=np.float32)
+        cd = np.asarray(camera_direction, dtype=np.float32)
+        self.camera_pos = cp
+        self.camera_dir = cd / (np.linalg.norm(cd) + 1e-9)
+        self._compute_basis()
+
+    def _compute_basis(self):
+        # Camera axes: z looks opposite to view dir; choose a stable up
+        self.cam_z = -self.camera_dir
+        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        if abs(float(np.dot(self.cam_z, up))) > 0.99:
+            up = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        self.cam_x = np.cross(up, self.cam_z).astype(np.float32)
+        self.cam_x /= (np.linalg.norm(self.cam_x) + 1e-9)
+        self.cam_y = np.cross(self.cam_z, self.cam_x).astype(np.float32)
+
+    def project(self, pts3: np.ndarray, grid: int = 256) -> Dict[str, np.ndarray]:
+        """
+        Project 3D points to 2D using camera basis and keep front-most per cell.
+        Returns dict with keys: points_2d (N,2), depth (N,), visible_mask (N,)
+        """
+        pts3 = np.asarray(pts3, dtype=np.float32)
+        rel = pts3 - self.camera_pos[None, :]
+        x = rel @ self.cam_x
+        y = rel @ self.cam_y
+        z = rel @ self.cam_z  # smaller is closer to camera plane
+
+        # Normalize x,y into [0,1] by simple min/max (frame-local)
+        # Then bin into a grid and keep smallest z per bin
+        xmin, xmax = float(x.min()), float(x.max())
+        ymin, ymax = float(y.min()), float(y.max())
+        xr = (x - xmin) / (max(xmax - xmin, 1e-6))
+        yr = (y - ymin) / (max(ymax - ymin, 1e-6))
+        ix = np.clip((xr * (grid - 1)).astype(np.int32), 0, grid - 1)
+        iy = np.clip((yr * (grid - 1)).astype(np.int32), 0, grid - 1)
+        flat = ix + iy * grid
+
+        # Keep closest per bin
+        best_z = {}
+        keep = np.zeros_like(z, dtype=bool)
+        for i, f in enumerate(flat):
+            zi = float(z[i])
+            if f not in best_z or zi < best_z[f][0]:
+                if f in best_z:
+                    keep[best_z[f][1]] = False
+                best_z[f] = (zi, i)
+                keep[i] = True
+
+        pts2 = np.stack([x[keep], y[keep]], axis=1)
+        depth = z[keep]
+        return {"points_2d": pts2, "depth": depth, "visible_mask": keep}
+
+
+class DataCollector:
+    """Buffers per-timestep data and saves a single file per iteration."""
+
+    def __init__(self, cfg: DataCollectionConfig, out_dir: str = "output", seed: Optional[int] = 42):
+        self.cfg = cfg
+        self.out = Path(out_dir)
+        self.out.mkdir(parents=True, exist_ok=True)
+        self.projector = PointCloudProjector(cfg.camera_position, cfg.camera_direction)
+        self.rng = np.random.RandomState(seed)
+        self.reset()
+
+    def reset(self):
+        self.buffer: List[Dict] = []
+
+    def should_collect(self, step: int, grasp_step: int, release_step: int) -> bool:
+        return (step >= grasp_step + self.cfg.grasp_offset_steps) and (step <= release_step + self.cfg.release_offset_steps)
+
+    def add_step(
+        self,
+        step_idx: int,
+        meshes_world: List[np.ndarray],     # list per env (V,3)
+        ee_positions: List[np.ndarray],     # list per env (3,)
+        contact_indices: List[np.ndarray],  # list per env (K,) or empty
+    ) -> None:
+        """Append one timestep worth of data for all environments."""
+        step_entry: Dict = {"step": step_idx, "envs": []}
+        for env_id, verts in enumerate(meshes_world):
+            verts = np.asarray(verts, dtype=np.float32)
+            # Sample subset for projection
+            if len(verts) > self.cfg.point_sample_count:
+                sel = self.rng.choice(len(verts), size=self.cfg.point_sample_count, replace=False)
+                sample = verts[sel]
+            else:
+                sample = verts
+                sel = np.arange(len(verts), dtype=np.int32)
+
+            proj = self.projector.project(sample, grid=self.cfg.grid)
+            step_entry["envs"].append(
+                {
+                    "mesh_vertices": verts,                  # Full mesh
+                    "sample_indices": sel,                   # Indices of sampled points from full mesh
+                    "points_2d": proj["points_2d"],        # Projected visible subset
+                    "depth": proj["depth"],               # Depths of visible subset
+                    "ee_position": np.asarray(ee_positions[env_id], dtype=np.float32),
+                    "contact_vertices": np.asarray(contact_indices[env_id], dtype=np.int32),
+                }
+            )
+        self.buffer.append(step_entry)
+
+    def save_iteration(self, iteration: int) -> Path:
+        """Save a single npz file for this iteration. One file contains all timesteps for all envs."""
+        path = self.out / f"iteration_{iteration:04d}.npz"
+        # Flatten structure into arrays-of-objects for compactness
+        steps = [entry["step"] for entry in self.buffer]
+        env_count = len(self.buffer[0]["envs"]) if self.buffer else 0
+
+        # Pack per-env sequences
+        packed = {"steps": np.array(steps, dtype=np.int32), "env_count": np.array([env_count], dtype=np.int32)}
+        for env_id in range(env_count):
+            meshes = [entry["envs"][env_id]["mesh_vertices"] for entry in self.buffer]
+            pts2d = [entry["envs"][env_id]["points_2d"] for entry in self.buffer]
+            depth = [entry["envs"][env_id]["depth"] for entry in self.buffer]
+            ee = [entry["envs"][env_id]["ee_position"] for entry in self.buffer]
+            contact = [entry["envs"][env_id]["contact_vertices"] for entry in self.buffer]
+
+            packed[f"env_{env_id:02d}_meshes"] = np.array(meshes, dtype=object)
+            packed[f"env_{env_id:02d}_points2d"] = np.array(pts2d, dtype=object)
+            packed[f"env_{env_id:02d}_depth"] = np.array(depth, dtype=object)
+            packed[f"env_{env_id:02d}_ee"] = np.array(ee, dtype=object)
+            packed[f"env_{env_id:02d}_contact"] = np.array(contact, dtype=object)
+
+        np.savez_compressed(path, **packed)
+        return path
+</file>
+
+<file path="example_cloth_franka_thin.py">
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+###########################################################################
+# Example Cloth Franka
+#
+# This simulation demonstrates a coupled robot-cloth simulation
+# using the VBD solver for the cloth and Featherstone for the robot,
+# showcasing its ability to handle complex contacts while ensuring it
+# remains intersection-free.
+#
+# Command: python -m newton.examples cloth_franka
+#
+###########################################################################
+
+from __future__ import annotations
+
+import numpy as np
+import warp as wp
+from pxr import Usd, UsdGeom
+
+import newton
+import newton.examples
+import newton.utils
+from newton import Model, ModelBuilder, State, eval_fk
+from newton.solvers import SolverFeatherstone, SolverVBD
+from newton.utils import transform_twist
+from newton.tests.unittest_utils import find_nan_members
+from newton.examples.cloth.data_collection import kernels as dc_kernels
+
+import os 
+import json
+import pymeshlab
+import trimesh
+from typing import Dict, List, Tuple, Optional
+import time
+
+
+"""
+Note: kernels were moved to newton.examples.cloth.data_collection.kernels
+to consolidate Warp kernels in a single place.
+"""
+
+
+class Example:
+    def __init__(self, viewer, n_env=4, mesh_file: Optional[str] = None, z_rotation: Optional[float] = None):
+        # parameters
+        #   simulation
+        self.add_cloth = True
+        self.add_robot = True
+        """
+        Deprecated shim module.
+
+        This file has been renamed to `cloth_franka_env.py` for clarity.
+        Please import `Example` from `newton.examples.cloth.data_collection.cloth_franka_env`.
+        """
+
+        from .cloth_franka_env import Example  # re-export for backward compatibility
+
+        __all__ = ["Example"]
+        #   contact
+
+        #       body-cloth contact
+</file>
+
+<file path="example_collect_dataset.py">
+"""
+Collect dataset from the existing Franka + cloth example without modifying core logic.
+
+This script drives the Example class step-by-step, samples cloth vertices,
+projects them with occlusion, logs end-effector positions, and saves one .npz per iteration.
+
+Notes:
+- Cloth library randomization and per-iteration mesh selection are not wired into Example yet.
+  The SimulationEnv stub (simulation_env.py) provides hooks to implement this inside your builder.
+- Contact vertex extraction is left as a TODO because the collision structure is model-dependent.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import List
+import math
+
+import numpy as np
+import warp as wp
+
+import newton
+from newton.examples.cloth.data_collection.data_collector import DataCollector, DataCollectionConfig
+from newton.examples.cloth.data_collection.trajectory_generator import TrajectoryConfig, TrajectoryGenerator
+from newton.examples.cloth.data_collection.cloth_franka_env import Example
+from newton.examples.cloth.data_collection import kernels as dc_kernels
+from newton.examples.cloth.data_collection.simulation_env import SimulationEnv, SimulationConfig
+
+
+def load_config(config_path: str | None) -> dict | None:
+    """Load JSON configuration file if provided."""
+    if config_path is None:
+        return None
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+
+def get_env_partition_counts(model, n_env: int) -> int:
+    # Assumes all particles belong to cloth and are evenly replicated across envs
+    assert model.particle_count % n_env == 0, "Particle count not divisible by envs; multiple cloths or mismatch?"
+    return model.particle_count // n_env
+
+
+def extract_meshes_by_env(state, per_env_particle_count: int, n_env: int) -> List[np.ndarray]:
+    q = state.particle_q
+    if q is None:
+        return [np.zeros((0, 3), dtype=np.float32) for _ in range(n_env)]
+    q_np = q.numpy()  # (total_particles, 3)
+    meshes = []
+    for env_id in range(n_env):
+        start = env_id * per_env_particle_count
+        end = start + per_env_particle_count
+        meshes.append(q_np[start:end])
+    return meshes
+
+
+def extract_ee_positions_by_env(example: Example, state) -> List[np.ndarray]:
+    """
+    Compute per-environment end-effector positions using a Warp kernel.
+
+    This avoids attempting to index `state.body_q` (a Warp array) on the host.
+    The kernel composes the body transform with the `endeffector_offset` and
+    writes out the translation for each environment thread (wp.tid()).
+    """
+
+    n = example.n_env
+    # ensure kernel runs on the same device as body_q
+    device = state.body_q.device if hasattr(state.body_q, "device") else None
+    with wp.ScopedDevice(device):
+        out = wp.empty(n, dtype=wp.vec3)
+        wp.launch(
+            dc_kernels.extract_ee_positions_kernel,
+            dim=n,
+            inputs=[state.body_q, example.endeffector_offset, example.endeffector_id, example.bodies_per_env],
+            outputs=[out],
+        )
+        out_np = out.numpy()
+
+    # return list of (3,) numpy arrays for downstream code
+    return [out_np[i].astype(np.float32) for i in range(n)]
+
+
+def compute_contact_indices(
+    meshes_world: List[np.ndarray],
+    ee_positions: List[np.ndarray],
+    table_top_z: float = 0.20,
+    ee_radius: float = 0.035,
+    table_margin: float = 0.003,
+) -> List[np.ndarray]:
+    """
+    Heuristic contact extraction:
+    - Robot contact: cloth vertices within ee_radius of the end-effector position
+    - Table contact: cloth vertices with z <= table_top_z + table_margin
+    Returns per-env arrays of vertex indices (relative to that env's mesh slice)
+    """
+    out = []
+    thresh2 = ee_radius * ee_radius
+    z_thresh = table_top_z + table_margin
+    for env_id, verts in enumerate(meshes_world):
+        if len(verts) == 0:
+            out.append(np.array([], dtype=np.int32))
+            continue
+        ee = ee_positions[env_id]
+        # distances to EE
+        d2 = np.sum((verts - ee[None, :]) ** 2, axis=1)
+        near_ee = d2 <= thresh2
+        near_table = verts[:, 2] <= z_thresh
+        idx = np.nonzero(near_ee | near_table)[0].astype(np.int32)
+        out.append(idx)
+    return out
+
+
+def main():
+    parser = newton.examples.create_parser()
+    parser.set_defaults(num_frames=1000)
+    parser.add_argument("--config", type=str, default=None, help="Path to JSON config file")
+    parser.add_argument("--iterations", type=int, default=5, help="Number of simulation iterations")
+    parser.add_argument("--n-env", type=int, default=2, help="Number of parallel environments")
+    parser.add_argument("--out-dir", type=str, default="output", help="Directory to save npz files")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for trajectory/data sampling")
+    parser.add_argument("--save-interval", type=int, default=1, help="Save every N steps")
+    parser.add_argument("--cloth-lib", type=str, default=None, help="Path to cloth library root (folders with meshes and optional metadata.json)")
+    parser.add_argument("--cloth-source", type=str, choices=["lib", "dir"], default=None, help="Choose to load cloth from 'lib' (library) or 'dir' (single mesh file)")
+    parser.add_argument("--mesh-file", type=str, default=None, help="Path to a single cloth mesh file (.obj/.stl) when using --cloth-source dir")
+    viewer, args = newton.examples.init(parser)
+
+    # Load config and override args if provided
+    config = load_config(args.config)
+    
+    # Initialize default values
+    table_top_z = 0.20
+    ee_radius = 0.035
+    table_margin = 0.003
+    cloth_base = np.array([0.5, 0.25, 0.25], dtype=np.float32)
+    cloth_extent = 0.4
+    
+    if config:
+        sim = config.get("simulation", {})
+        paths = config.get("paths", {})
+        traj_cfg_dict = config.get("trajectory", {})
+        dc_cfg_dict = config.get("data_collection", {})
+        contact_cfg = config.get("contact", {})
+        cloth_cfg = config.get("cloth", {})
+        
+        # Override args with config values (CLI args still take precedence if explicitly set)
+        args.n_env = sim.get("n_env", args.n_env)
+        args.iterations = sim.get("iterations", args.iterations)
+        args.num_frames = sim.get("num_frames", args.num_frames)
+        args.seed = sim.get("seed", args.seed)
+        args.save_interval = sim.get("save_interval", args.save_interval)
+        args.viewer = sim.get("viewer", getattr(args, "viewer", None))
+        args.out_dir = paths.get("out_dir", args.out_dir)
+        args.cloth_lib = paths.get("cloth_library_dir", args.cloth_lib)
+        # Cloth source and mesh-file (config-driven unless CLI provided)
+        cfg_source = cloth_cfg.get("source", None)  # 'library' | 'dir'
+        if args.cloth_source is None and cfg_source is not None:
+            args.cloth_source = "lib" if cfg_source == "library" else ("dir" if cfg_source == "dir" else args.cloth_source)
+        args.mesh_file = paths.get("mesh_file", args.mesh_file)
+        
+        # Build TrajectoryConfig from config
+        timing_cfg = traj_cfg_dict.get("timing", {})
+        _traj_cfg = TrajectoryConfig(
+            position_noise_std=traj_cfg_dict.get("position_noise_std", 0.02),
+            timing_noise_std=traj_cfg_dict.get("timing_noise_std", 0.1),
+            grasp_height=traj_cfg_dict.get("grasp_height", 0.21),
+            lift_height=traj_cfg_dict.get("lift_height", 0.35),
+            drop_offset_range=tuple(traj_cfg_dict.get("drop_offset_range", [-0.15, 0.15])),
+            grasp_dwell=timing_cfg.get("grasp_dwell", 0.5),
+            drop_dwell=timing_cfg.get("drop_dwell", 0.5),
+        )
+        
+        # Build DataCollectionConfig from config
+        camera_cfg = dc_cfg_dict.get("camera", {})
+        dc_cfg = DataCollectionConfig(
+            grasp_offset_steps=dc_cfg_dict.get("grasp_offset_steps", 5),
+            release_offset_steps=dc_cfg_dict.get("release_offset_steps", 5),
+            point_sample_count=dc_cfg_dict.get("point_sample_rate", 1000),
+            camera_position=np.array(camera_cfg.get("position", [0.5, 0.0, 2.0]), dtype=np.float32),
+            camera_direction=np.array(camera_cfg.get("direction", [0.0, 0.0, -1.0]), dtype=np.float32),
+            grid=camera_cfg.get("grid", 256),
+            save_interval=args.save_interval
+        )
+        
+        # Extract contact parameters
+        table_top_z = contact_cfg.get("table_top_z", 0.20)
+        ee_radius = contact_cfg.get("ee_radius", 0.035)
+        table_margin = contact_cfg.get("table_margin", 0.003)
+        
+        # Extract cloth parameters
+        cloth_base = np.array(cloth_cfg.get("base_position", [0.5, 0.25, 0.25]), dtype=np.float32)
+        cloth_extent = traj_cfg_dict.get("cloth_extent_m", 0.4)
+    else:
+        # Use defaults
+        _traj_cfg = TrajectoryConfig()
+        dc_cfg = DataCollectionConfig(save_interval=args.save_interval)
+
+    # Determine cloth source
+    # Priority: CLI --cloth-source > config cloth.source > default fallback
+    if args.cloth_source is None:
+        # default heuristic: use lib if cloth_lib is provided, else dir
+        args.cloth_source = "lib" if args.cloth_lib else "dir"
+
+    # Initialize cloth library only if we use it
+    sim_env = None
+    if args.cloth_source == "lib" and args.cloth_lib:
+        # Orientation config for library-driven sampling
+        use_default_orientation = False
+        rot_sample_deg_min = 0.0
+        rot_sample_deg_max = 360.0
+        if config:
+            cloth_cfg = config.get("cloth", {})
+            orient_cfg = cloth_cfg.get("orientation", {})
+            use_default_orientation = bool(orient_cfg.get("use_default", False))
+            if "sampling_degrees" in orient_cfg and isinstance(orient_cfg["sampling_degrees"], (list, tuple)) and len(orient_cfg["sampling_degrees"]) == 2:
+                rot_sample_deg_min = float(orient_cfg["sampling_degrees"][0])
+                rot_sample_deg_max = float(orient_cfg["sampling_degrees"][1])
+
+        base_dir = Path(__file__).resolve().parent
+        sim_env = SimulationEnv(SimulationConfig(
+            env_count=args.n_env,
+            cloth_library_dir=(base_dir / args.cloth_lib).resolve(),
+            use_default_orientation=use_default_orientation,
+            rot_sample_deg_min=rot_sample_deg_min,
+            rot_sample_deg_max=rot_sample_deg_max,
+        ))
+
+    # Initialize trajectory generator and data collector
+    _traj_gen = TrajectoryGenerator(_traj_cfg, seed=args.seed)
+    collector = DataCollector(dc_cfg, out_dir=args.out_dir, seed=args.seed)
+
+    steps_per_iter = args.num_frames
+    datapoint_counter = 0
+
+    for it in range(args.iterations):
+        # Select mesh per source
+        mesh_file = None
+        z_rot = None
+        if args.cloth_source == "lib" and sim_env is not None:
+            spec = sim_env.pick_cloth_for_iteration()
+            z_rot = sim_env.random_cloth_orientation()  # Optional[float]; None means use metadata default
+            mesh_file = str(spec.mesh_path) if spec is not None else None
+        else:
+            # DIR mode: respect same orientation config if provided
+            mesh_file = args.mesh_file
+            z_rot = 0.0
+            if config:
+                cloth_cfg = config.get("cloth", {})
+                orient_cfg = cloth_cfg.get("orientation", {})
+                use_default = bool(orient_cfg.get("use_default", False))
+                if use_default:
+                    z_rot = None  # defer to metadata default
+                else:
+                    if "sampling_degrees" in orient_cfg and isinstance(orient_cfg["sampling_degrees"], (list, tuple)) and len(orient_cfg["sampling_degrees"]) == 2:
+                        deg_min = float(orient_cfg["sampling_degrees"][0])
+                        deg_max = float(orient_cfg["sampling_degrees"][1])
+                        # Sample deterministically per-iteration for reproducibility
+                        rng = np.random.RandomState(args.seed + it)
+                        deg = float(rng.uniform(deg_min, deg_max))
+                        z_rot = math.radians(deg)
+
+        # Wire environment to use config and optional base position override from config
+        example = Example(
+            viewer,
+            n_env=args.n_env,
+            mesh_file=mesh_file,
+            z_rotation=z_rot,
+            base_position=tuple(cloth_base.tolist()) if isinstance(cloth_base, np.ndarray) else tuple(cloth_base),
+            config=config,
+        )
+        
+        # Quadrant indices are now available on example.quadrant_indices if metadata was loaded
+        # Can be used for trajectory seeding or grasp point selection
+        if example.quadrant_indices:
+            print(f"[iteration {it}] Loaded quadrant indices with {sum(len(v) for v in example.quadrant_indices.values())} total vertices")
+        
+        # Generate per-env trajectories centered on each env's actual cloth base position from metadata
+        base = np.array([
+            float(example.cloth_base_pos[0]),
+            float(example.cloth_base_pos[1]),
+            float(example.cloth_base_pos[2])
+        ], dtype=np.float32)
+        cloth_centers = [tuple((base + example.env_offsets[i]).tolist()) for i in range(example.n_env)]
+        trajs = _traj_gen.generate_batch(example.n_env, cloth_centers, cloth_extent_m=cloth_extent)
+        example.set_generated_trajectories(trajs)
+        per_env_particles = get_env_partition_counts(example.model, example.n_env)
+        # For now, collect full range; if you have grasp/release steps, pass them to should_collect
+        grasp_step = 0
+        release_step = steps_per_iter - 1
+
+        collector.reset()
+
+        for step_idx in range(steps_per_iter):
+            if not example.viewer.is_paused():
+                example.step()
+            example.render()
+
+            if step_idx % dc_cfg.save_interval != 0:
+                continue
+
+            if not collector.should_collect(step_idx, grasp_step, release_step):
+                continue
+
+            # Extract per-env cloth meshes and end-effector positions
+            meshes_world = extract_meshes_by_env(example.state_0, per_env_particles, example.n_env)
+            ee_positions = extract_ee_positions_by_env(example, example.state_0)
+            # Heuristic contact vertices: EE proximity or near table top
+            contact_indices = compute_contact_indices(meshes_world, ee_positions)
+
+            collector.add_step(step_idx, meshes_world, ee_positions, contact_indices)
+
+        # Save each TIME STEP and ENVIRONMENT as its own datapoint folder
+        # Folder: out_dir/datapoint_{i}/ with separate .npy arrays per datapoint
+        if collector.buffer:
+            env_count = len(collector.buffer[0]["envs"]) if collector.buffer else 0
+            for t_idx, entry in enumerate(collector.buffer):
+                step_val = int(entry["step"])
+                for env_id in range(env_count):
+                    env_entry = entry["envs"][env_id]
+                    dp_dir = Path(args.out_dir) / f"datapoint_{datapoint_counter}"
+                    dp_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Save each array separately
+                    np.save(dp_dir / "step.npy", np.array(step_val, dtype=np.int32))
+                    np.save(dp_dir / "mesh_vertices.npy", env_entry["mesh_vertices"])  # (V,3)
+                    np.save(dp_dir / "points2d.npy", env_entry["points_2d"])         # (K,2)
+                    np.save(dp_dir / "depth.npy", env_entry["depth"])                 # (K,)
+                    np.save(dp_dir / "ee.npy", env_entry["ee_position"])              # (3,)
+                    np.save(dp_dir / "contact.npy", env_entry["contact_vertices"])    # (Kc,)
+
+                    datapoint_counter += 1
+            print(f"Saved {datapoint_counter} total datapoints under {args.out_dir} so far")
+
+        # Optional USD export per iteration (only if viewer == 'usd')
+        if getattr(args, "viewer", None) == "usd" and collector.buffer:
+            try:
+                from pxr import Usd, UsdGeom, Gf
+                usd_path = Path(args.out_dir) / f"iteration_{it:04d}.usd"
+                stage = Usd.Stage.CreateNew(str(usd_path))
+                UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+                world = UsdGeom.Xform.Define(stage, "/World")
+                # Use first saved timestep as a static snapshot
+                snapshot = collector.buffer[0]
+                for env_id in range(len(snapshot["envs"])):
+                    env_entry = snapshot["envs"][env_id]
+                    pts = env_entry["mesh_vertices"].astype(np.float32)
+                    prim_path = f"/World/ClothEnv_{env_id:02d}"
+                    points = UsdGeom.Points.Define(stage, prim_path)
+                    points.CreatePointsAttr([Gf.Vec3f(float(x), float(y), float(z)) for x, y, z in pts])
+                    points.CreateDisplayColorAttr([Gf.Vec3f(0.7, 0.7, 0.9)])
+                stage.GetRootLayer().Save()
+                print(f"USD snapshot saved: {usd_path}")
+            except Exception as e:
+                print(f"USD export skipped (error: {e})")
+
+        # Reset/close between iterations
+        # Recreate example next iteration when using cloth library
+        if sim_env is None and it < args.iterations - 1:
+            example.reset()
+
+    example.viewer.close()
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="kernels.py">
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import warp as wp
+from newton.utils import transform_twist
+
+
+# Note: Warp requires concrete type annotations on kernel parameters.
+# We use wp.array(dtype=...) directly in annotations for runtime correctness.
+
+
+@wp.kernel
+def compute_ee_delta(
+    body_q: wp.array(dtype=wp.transform),
+    offset: wp.transform,
+    body_id: int,
+    target: wp.transform,
+    # outputs
+    ee_delta: wp.array(dtype=wp.spatial_vector),
+):
+    """
+    Compute the 6D pose delta (translation xyz, rotation as quaternion components wxyz)
+    between the current end-effector (body_id with offset applied) and a target transform.
+
+    Notes:
+    - body_id should already include any environment-specific offset.
+    - The result is written to ee_delta[0].
+    """
+    tf = body_q[body_id] * offset
+    pos = wp.transform_get_translation(tf)
+    pos_des = wp.transform_get_translation(target)
+    pos_diff = pos_des - pos
+    rot = wp.transform_get_rotation(tf)
+    rot_des = wp.transform_get_rotation(target)
+    ang_diff = rot_des * wp.quat_inverse(rot)
+    ee_delta[0] = wp.spatial_vector(pos_diff[0], pos_diff[1], pos_diff[2], ang_diff[0], ang_diff[1], ang_diff[2])
+
+
+def make_compute_body_out_kernel(offset: wp.transform, body_id: int):
+    """
+    Factory that returns a Warp kernel specialized to a particular body_id and offset.
+
+    The kernel maps body spatial velocity at the given body_id through the offset using
+    transform_twist, writing a 6D spatial velocity into body_out.
+    """
+
+    @wp.kernel
+    def compute_body_out(body_qd: wp.array(dtype=wp.spatial_vector), body_out: wp.array(dtype=float)):
+        mv = transform_twist(wp.static(offset), body_qd[wp.static(body_id)])
+        for i in range(6):
+            body_out[i] = mv[i]
+
+    return compute_body_out
+
+
+@wp.kernel
+def extract_ee_positions_kernel(
+    body_q: wp.array(dtype=wp.transform),
+    ee_offset: wp.transform,
+    ee_body_id: int,
+    bodies_per_env: int,
+    out_pos: wp.array(dtype=wp.vec3),
+):
+    """
+    Per-env kernel: for thread env_id, reads body transform at ee_body_id + env_id * bodies_per_env,
+    applies ee_offset, and writes the translation to out_pos[env_id].
+    """
+    env_id = wp.tid()
+    idx = ee_body_id + env_id * bodies_per_env
+    tf = body_q[idx] * ee_offset
+    out_pos[env_id] = wp.transform_get_translation(tf)
+
+
+@wp.kernel
+def extract_ee_rotations_kernel(
+    body_q: wp.array(dtype=wp.transform),
+    ee_offset: wp.transform,
+    ee_body_id: int,
+    bodies_per_env: int,
+    out_rot: wp.array(dtype=wp.quat),
+):
+    """
+    Per-env kernel: for thread env_id, reads body transform at ee_body_id + env_id * bodies_per_env,
+    applies ee_offset, and writes the rotation quaternion to out_rot[env_id] (wxyz order).
+    """
+    env_id = wp.tid()
+    idx = ee_body_id + env_id * bodies_per_env
+    tf = body_q[idx] * ee_offset
+    out_rot[env_id] = wp.transform_get_rotation(tf)
+</file>
+
+<file path="README.md">
+# Cloth Manipulation Dataset Collection
+
+Complete system for collecting robotic cloth manipulation datasets using Newton physics simulation with per-environment trajectory generation and randomized cloth library.
+
+## ✅ Trajectory System Status
+
+**VERIFIED ACTIVE**: Per-environment generated trajectories are fully integrated and running.
+
+### Current Trajectory Flow
+
+Each environment executes an independent sequence with 5 distinct phases:
+
+1. **Phase 1: Approach / Descend** (0 → `grasp_time`)
+   - Move from `lift_pos` → `grasp_pos` (or `pre_grasp` → `grasp`)
+   - Gripper: **OPEN**
+   - Interpolation: Linear
+
+2. **Phase 2: Grasp Dwell** (`grasp_time` → `grasp_time + grasp_dwell`)
+   - Hold at `post_grasp_pos`
+   - Gripper: **CLOSING** (Transitions to closed)
+   - Allows physics to stabilize grasp
+
+3. **Phase 3: Lift / Ascend** (`...` → `... + lift_time`)
+   - Move from `post_grasp_pos` → `lift_pos`
+   - Gripper: **CLOSED**
+   - Lifts cloth from table
+
+4. **Phase 4: Transport** (`...` → `... + drop_time`)
+   - Move from `lift_pos` → `drop_pos` (or `pre_drop`)
+   - Gripper: **CLOSED**
+   - Carries cloth to release zone
+
+5. **Phase 5: Drop Dwell** (`...` → `total_time`)
+   - Hold at `post_drop_pos`
+   - Gripper: **OPEN**
+   - Releases cloth
+
+### Per-Environment Randomization
+
+Each environment gets **unique** trajectory parameters:
+- **Grasp position**: Random point on cloth surface ± position noise
+- **Drop position**: Offset from lift by random amount in configurable range
+- **Timing**: Each phase duration has ± timing noise
+- **Cloth center**: Automatically offset based on environment grid position
+
+---
+
+## 📁 Configuration System
+
+### JSON Config File
+
+Control all simulation parameters via `config.json`. The structure supports nested configuration for robot, control, and cloth properties.
+
+```json
+{
+  "simulation": {
+    "n_env": 4,
+    "iterations": 10,
+    "num_frames": 1000,
+    "seed": 42,
+    "save_interval": 1,
+    "viewer": "usd",
+    "device": "cuda:0",
+    "add_cloth": true,
+    "add_robot": true,
+    "fps": 60,
+    "sim_substeps": 15
+  },
+  "paths": {
+    "out_dir": "output",
+    "cloth_library_dir": "assets",
+    "mesh_file": null
+  },
+  "cloth": {
+    "source": "library",
+    "orientation": {
+      "use_default": false,
+      "sampling_degrees": [-180, 180]
+    },
+    "keep_flat": true,
+    "use_same_mesh_per_env": true,
+    "base_position": [0.5, 0.25, 0.25],
+    "solver_iterations": 5
+  },
+  "trajectory": {
+    "position_noise_std": 0.02,
+    "timing_noise_std": 0.1,
+    "grasp_height": 0.20,
+    "lift_height": 0.5,
+    "drop_offset_range": [-0.15, 0.15],
+    "cloth_extent_m": 0.4,
+    "timing": {
+      "grasp_dwell": 0.5,
+      "drop_dwell": 0.5
+    },
+    "orientations": {
+      "down_quat": [1.0, 0.0, 0.0, 0.0]
+    }
+  },
+  "data_collection": {
+    "grasp_offset_steps": 5,
+    "release_offset_steps": 5,
+    "point_sample_rate": 1000,
+    "camera": {
+      "position": [0.5, 0.0, 2.0],
+      "direction": [0.0, 0.0, -1.0],
+      "grid": 256
+    }
+  },
+  "contact": {
+    "table_top_z": 0.20,
+    "ee_radius": 0.035,
+    "table_margin": 0.003,
+    "robot_friction": 1.0,
+    "table_friction": 0.5
+  },
+  "control": {
+    "gripper_open": 0.8,
+    "gripper_closed": 0.03,
+    "k_null": 1.0,
+    "use_nullspace": true,
+    "max_joint_qd": 2.0
+  },
+  "robot": {
+    "flip_about_xy": false,
+    "base_position": [-0.25, 0.0, 0.0]
+  }
+}
+```
+
+### Parameter Reference
+
+#### `simulation`
+- `n_env`: Number of parallel environments.
+- `iterations`: Number of reset-and-run cycles.
+- `num_frames`: Steps per iteration.
+- `sim_substeps`: Physics substeps per frame (default: 15).
+
+#### `cloth`
+- `source`: "library" (random selection) or "dir" (single file).
+- `orientation.sampling_degrees`: [min, max] range for random Z-rotation.
+- `base_position`: World-space cloth placement [x, y, z].
+- `solver_iterations`: Solver iterations for cloth physics (default: 5).
+
+#### `trajectory`
+- `position_noise_std`: Gaussian noise on grasp/drop positions.
+- `timing.grasp_dwell`: Time to hold grasp before lifting.
+- `orientations.down_quat`: Fixed end-effector orientation quaternion.
+
+#### `control`
+- `k_null`: Null-space stiffness for IK.
+- `max_joint_qd`: Velocity clamp for safety.
+- `gripper_open/closed`: Width parameters.
+
+#### `robot`
+- `base_position`: Robot base location [x, y, z].
+- `flip_about_xy`: Rotate robot 180 deg (if needed for coordinate conventions).
+
+---
+
+## 🚀 Usage
+
+### Run with Config File
+
+```powershell
+# Use config file
+python -m newton.examples.cloth.data_collection.example_collect_dataset --config config.json
+
+# Override specific parameters via CLI (takes precedence)
+python -m newton.examples.cloth.data_collection.example_collect_dataset --config config.json --n-env 8 --iterations 20
+
+# Run without config (uses defaults)
+python -m newton.examples.cloth.data_collection.example_collect_dataset --n-env 4 --iterations 5 --cloth-lib assets
+```
+
+### CLI Arguments
+
+All config.json parameters can be overridden via command-line:
+
+```powershell
+--config PATH          # Path to JSON config file
+--n-env N              # Number of parallel environments
+--iterations N         # Number of simulation iterations
+--num-frames N         # Steps per iteration
+--seed N               # Random seed
+--save-interval N      # Save every N steps
+--out-dir PATH         # Output directory
+--cloth-lib PATH       # Cloth library directory
+--cloth-source {lib,dir} # Source mode
+--mesh-file PATH       # Specific mesh file (if source=dir)
+--viewer {usd,gl,none} # Viewer type
+```
+
+---
+
+## 📦 Output Format
+
+### Per-Datapoint Folders
+
+Each timestep × environment produces a separate folder:
+
+```
+output/
+├── datapoint_0/
+│   ├── step.npy          # int32: timestep index
+│   ├── mesh_vertices.npy # float32 (V, 3): cloth vertex positions
+│   ├── points2d.npy      # float32 (K, 2): projected 2D points (normalized)
+│   ├── depth.npy         # float32 (K,): depth values
+│   ├── ee.npy            # float32 (3,): end-effector position
+│   └── contact.npy       # int32 (C,): contact vertex indices
+├── datapoint_1/
+│   └── ...
+```
+
+### Optional USD Snapshots
+
+When `viewer == "usd"`, saves a USD file per iteration:
+
+```
+output/
+└── iteration_0000.usd   # First saved timestep, all envs as Points
+```
+
+---
+
+## 🧪 Cloth Library Setup
+
+The cloth preprocessing and dataset preparation docs have moved.
+
+- For metadata population and preprocessing (center + remesh + quadrants), see:
+  `newton/examples/cloth/data_collection/cloth_preprocessing/README.md`
+
+Runtime note: the environment assumes meshes are preprocessed and reads cloth parameters and orientation only from `metadata.json` or the run config.
+
+---
+
+## 🔧 Architecture
+
+### Module Organization
+
+```
+data_collection/
+├── cloth_franka_env.py            # Main simulation environment (import only)
+├── example_collect_dataset.py     # Dataset collection driver
+├── kernels.py                     # Centralized Warp kernels
+├── data_collector.py              # Projection & buffering
+├── trajectory_generator.py        # Per-env trajectory generation
+├── simulation_env.py              # Cloth library management
+├── config.json                    # Configuration template
+└── README.md                      # This file
+```
+
+### Kernel Consolidation
+
+All Warp kernels live in `kernels.py`:
+- `compute_ee_delta`: End-effector pose error
+- `make_compute_body_out_kernel`: Jacobian body-out kernel factory
+- `extract_ee_positions_kernel`: Per-env EE position extraction
+
+---
+
+## 🎯 Key Features
+
+### ✅ Per-Environment Trajectories
+- Each env has independent grasp/lift/drop positions
+- Reproducible via seeded RNG
+- Position and timing noise for diversity
+
+### ✅ Robust Multi-Env Control
+- **Corrected Jacobian**: Computes Jacobian per-environment using correct body IDs.
+- **Null-space Control**: Maintains "elbow-up" posture via null-space projection.
+- **Velocity Clamping**: Prevents instability via `max_joint_qd`.
+
+### ✅ Cloth Library Integration
+- Random mesh selection per iteration
+- Random Z-rotation per iteration
+- Consistent mesh across envs within iteration
+
+### ✅ Occlusion-Aware Projection
+- Orthographic-like camera projection
+- Z-buffer occlusion via grid binning
+- Per-frame normalization of 2D coordinates
+
+---
+
+## 🐛 Troubleshooting
+
+### "Incomplete argument annotations on function..."
+
+**Cause**: Warp kernel parameters missing type annotations.
+
+**Fix**: Ensure all kernel parameters have `wp.array(dtype=...)` annotations (already fixed in `kernels.py`).
+
+### "Variable not allowed in type expression"
+
+**Status**: This is a static checker warning about Warp's annotation style. Safe to ignore—runtime works correctly.
+
+### Trajectories Not Diverging Between Envs
+
+**Check**: Verify `example.set_generated_trajectories(trajs)` is called before simulation starts.
+
+### Cloth Library Not Loading
+
+**Check**: Ensure `cloth_library_dir` points to a directory containing subfolders with `.obj` or `.stl` files.
+
+---
+
+## 📊 Performance Tips
+
+### CUDA Graph Capture
+
+The simulation automatically captures CUDA graphs when using GPU. If you see repeated "Module load" messages, ensure kernels are precompiled (already done via `set_up_control`).
+
+### Large-Scale Dataset Collection
+
+For maximum throughput:
+1. Increase `n_env` (e.g., 16-32 environments)
+2. Set `save_interval > 1` to reduce I/O
+3. Use `viewer: "none"` to disable rendering
+4. Consider batching multiple iterations per process
+
+---
+
+## 📚 References
+
+- Newton Physics: https://github.com/NVIDIA/newton
+- Warp: https://github.com/NVIDIA/warp
+- Trajectory Generator: `trajectory_generator.py`
+- Data Collector: `data_collector.py`
+</file>
+
+<file path="simulation_env.py">
+"""
+Simulation environment wrapper for Newton: builds replicated Franka + cloth scene,
+handles per-iteration cloth randomization (orientation only), and exposes helpers
+for per-env world transforms.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import json
+import math
+import numpy as np
+
+from newton import utils as nutils
+from newton import geometry as ngeom
+
+
+@dataclass
+class ClothSpec:
+    mesh_path: Path
+    name: str
+    metadata: Dict
+
+
+@dataclass
+class SimulationConfig:
+    env_count: int = 4
+    env_spacing: float = 1.0
+    table_size: Tuple[float, float, float] = (0.8, 0.8, 0.05)
+    table_height: float = 0.6
+    cloth_size_hint: float = 0.4  # only for placement spacing hints
+    cloth_library_dir: Optional[Path] = None  # root directory containing cloth_type_i folders
+    random_seed: int = 123
+    # Orientation control
+    use_default_orientation: bool = False  # if True, defer to metadata default orientation (no sampling)
+    rot_sample_deg_min: float = 0.0       # inclusive min degrees for Z-rotation sampling
+    rot_sample_deg_max: float = 360.0     # exclusive max degrees for Z-rotation sampling
+
+
+class SimulationEnv:
+    def __init__(self, cfg: SimulationConfig):
+        self.cfg = cfg
+        self.rng = np.random.RandomState(cfg.random_seed)
+        self.env_offsets = self._compute_env_offsets(cfg.env_count, cfg.env_spacing)
+        self._cloth_specs: List[ClothSpec] = []
+        if cfg.cloth_library_dir:
+            self._cloth_specs = self._load_cloth_library(cfg.cloth_library_dir)
+
+        # Placeholders for external integration (Model/Builder/State)
+        self.model = None
+        self.builder = None
+        self.state = None
+
+    @staticmethod
+    def _compute_env_offsets(n: int, spacing: float) -> List[np.ndarray]:
+        # Arrange envs in a grid close to square
+        cols = int(math.ceil(math.sqrt(n)))
+        rows = int(math.ceil(n / cols))
+        offsets = []
+        idx = 0
+        for r in range(rows):
+            for c in range(cols):
+                if idx >= n:
+                    break
+                offsets.append(np.array([c * spacing, r * spacing, 0.0], dtype=np.float32))
+                idx += 1
+        return offsets
+
+    @staticmethod
+    def _load_cloth_library(root: Path) -> List[ClothSpec]:
+        specs: List[ClothSpec] = []
+        root = Path(root)
+        if not root.exists():
+            return specs
+        for child in sorted(root.iterdir()):
+            if not child.is_dir():
+                continue
+            # Expect mesh file and optional metadata.json
+            mesh_candidates = list(child.glob("*.obj")) + list(child.glob("*.stl"))
+            if not mesh_candidates:
+                continue
+            mesh_path = mesh_candidates[0]
+            meta = {}
+            meta_path = child / "metadata.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    meta = {}
+            # Prefer metadata-provided mesh_file if present and exists
+            if isinstance(meta, dict) and "mesh_file" in meta:
+                candidate = child / str(meta.get("mesh_file"))
+                if candidate.exists():
+                    mesh_path = candidate
+            specs.append(ClothSpec(mesh_path=mesh_path, name=child.name, metadata=meta))
+        return specs
+
+    def pick_cloth_for_iteration(self) -> Optional[ClothSpec]:
+        if not self._cloth_specs:
+            return None
+        return self.rng.choice(self._cloth_specs)
+
+    def cloth_center_world(self, env_id: int) -> np.ndarray:
+        # Center on table top for each env
+        offset = self.env_offsets[env_id]
+        x = offset[0] + 0.0
+        y = offset[1] + 0.0
+        z = self.cfg.table_height + 0.5 * self.cfg.table_size[2] + 1e-3
+        return np.array([x, y, z], dtype=np.float32)
+
+    def random_cloth_orientation(self) -> Optional[float]:
+        """
+        Returns:
+            Optional[float]:
+                - None to indicate 'use default from metadata'
+                - Otherwise, a sampled Z-rotation in radians, drawn uniformly from the configured degrees range
+        """
+        if self.cfg.use_default_orientation:
+            return None
+        dmin = float(self.cfg.rot_sample_deg_min)
+        dmax = float(self.cfg.rot_sample_deg_max)
+        # Normalize and guard against invalid ranges
+        if not math.isfinite(dmin) or not math.isfinite(dmax):
+            dmin, dmax = 0.0, 360.0
+        if abs(dmax - dmin) < 1e-9:
+            # Zero-width range → effectively default orientation (but explicit angle)
+            return float(math.radians(dmin))
+        # Sample uniformly in [dmin, dmax)
+        d = float(self.rng.uniform(dmin, dmax))
+        return float(math.radians(d))
+
+    # ---- Integration hooks (to be wired into actual Newton builder/model) ----
+
+    def build_scene(self, cloth_spec: Optional[ClothSpec]) -> None:
+        """
+        This function should be integrated with newton.Builder to create:
+        - A table per env
+        - A Franka per env
+        - A cloth per env using cloth_spec, placed at cloth_center with random Z-rotation
+        - Replication across envs using env_offsets
+
+        Here we provide the algorithm and data needed; actual Builder calls must
+        be written where your Newton project constructs bodies.
+        """
+        # Pseudocode comments only; integration is repo-specific.
+        # Use self.env_offsets, self.cloth_center_world(env), self.random_cloth_orientation()
+        pass
+
+    def get_env_offsets(self) -> List[np.ndarray]:
+        return self.env_offsets
+</file>
+
+<file path="trajectory_generator.py">
+"""
+Trajectory generation utilities for multi-environment cloth manipulation.
+
+Generates simple grasp-lift-drop trajectories with configurable noise.
+Each environment receives an independent trajectory seeded from a master seed.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+import numpy as np
+
+
+@dataclass
+class TrajectoryConfig:
+    """
+    Configuration for per-environment trajectory generation.
+
+    All distances are in meters, times in seconds.
+    """
+
+    # Noise controls (keep visibly editable/tunable)
+    position_noise_std: float = 0.02    # XYZ Gaussian noise on waypoints (m)
+    timing_noise_std: float = 0.10      # Gaussian noise on segment durations (s)
+
+    # Waypoint heights
+    grasp_height: float = 0.20          # Z at grasp
+    lift_height: float = 0.35           # Z at lift (above table)
+
+    # Drop displacement ranges relative to lift (in XY)
+    drop_offset_range: Tuple[float, float] = (-0.15, 0.15)
+
+    # Safety caps
+    min_segment_time: float = 0.4       # Lower bound on any segment duration
+
+    # Dwell (stationary) durations at grasp and drop (seconds)
+    grasp_dwell: float = 0.5
+    drop_dwell: float = 0.5
+
+
+class TrajectoryGenerator:
+    """
+    Generates simple one-motion trajectories (grasp -> lift -> drop -> open)
+    for each environment with small position/timing noise.
+    """
+
+    def __init__(self, config: Optional[TrajectoryConfig] = None, seed: Optional[int] = None):
+        self.config = config or TrajectoryConfig()
+        self.master_rng = np.random.RandomState(seed)
+
+    def _rng_for_env(self, env_id: int) -> np.random.RandomState:
+        # Derive a deterministic child RNG per environment for reproducibility
+        seed = self.master_rng.randint(0, 2**31 - 1)
+        return np.random.RandomState(seed + env_id * 9973)
+
+    def generate_for_env(
+        self,
+        env_id: int,
+        cloth_center_xyz: Tuple[float, float, float],
+        cloth_extent_m: float,
+    ) -> Dict:
+        """
+        Generate a single environment trajectory.
+
+        Returns a dict with:
+        - grasp_pos, lift_pos, drop_pos: np.ndarray shape (3,)
+        - grasp_time, lift_time, drop_time, total_time: floats
+        - env_id: int
+        """
+        rng = self._rng_for_env(env_id)
+        cx, cy, cz = cloth_center_xyz
+        half = cloth_extent_m * 0.5
+
+        # Grasp on the cloth with small noise
+        gx = cx + rng.uniform(-half, half) + rng.normal(0.0, self.config.position_noise_std)
+        gy = cy + rng.uniform(-half, half) + rng.normal(0.0, self.config.position_noise_std)
+        gz = self.config.grasp_height + rng.normal(0.0, self.config.position_noise_std)
+        grasp = np.array([gx, gy, gz], dtype=np.float32)
+
+        # Lift: vertically above the grasp
+        lift = grasp.copy()
+        lift[2] = self.config.lift_height + rng.normal(0.0, self.config.position_noise_std)
+
+        # Drop: small XY displacement from lift
+        doff = self.config.drop_offset_range
+        dx = rng.uniform(doff[0], doff[1])
+        dy = rng.uniform(doff[0], doff[1])
+        drop = lift + np.array([dx, dy, 0.0], dtype=np.float32)
+
+        # Timings with noise and clamped minimums (move durations)
+        grasp_time = max(self.config.min_segment_time, 2.0 + rng.normal(0.0, self.config.timing_noise_std))
+        lift_time = max(self.config.min_segment_time, 2.0 + rng.normal(0.0, self.config.timing_noise_std))
+        drop_time = max(self.config.min_segment_time, 1.5 + rng.normal(0.0, self.config.timing_noise_std))
+
+        # Dwell (stationary) durations
+        grasp_dwell = max(0.0, float(self.config.grasp_dwell))
+        drop_dwell = max(0.0, float(self.config.drop_dwell))
+
+        total_time = float(grasp_time + grasp_dwell + lift_time + drop_time + drop_dwell)
+
+        return {
+            "env_id": env_id,
+            # Core phase waypoints
+            "grasp_pos": grasp,
+            "lift_pos": lift,
+            "drop_pos": drop,
+            # Pre/Post phase waypoints (explicit, currently equal to their core counterparts)
+            # Pre-grasp: approach target at which gripper is still open
+            "pre_grasp_pos": grasp.copy(),
+            # Post-grasp: same position while gripper transitions to closed during dwell
+            "post_grasp_pos": grasp.copy(),
+            # Pre-drop: transport target while gripper is still closed
+            "pre_drop_pos": drop.copy(),
+            # Post-drop: same position while gripper transitions to open during dwell
+            "post_drop_pos": drop.copy(),
+            "grasp_time": float(grasp_time),
+            "grasp_dwell": float(grasp_dwell),
+            "lift_time": float(lift_time),
+            "drop_time": float(drop_time),
+            "drop_dwell": float(drop_dwell),
+            "total_time": total_time,
+        }
+
+    def generate_batch(
+        self,
+        n_env: int,
+        cloth_centers_xyz: List[Tuple[float, float, float]],
+        cloth_extent_m: float,
+    ) -> List[Dict]:
+        """Generate per-environment trajectories as a list of dicts."""
+        assert len(cloth_centers_xyz) == n_env, "cloth_centers_xyz must match n_env"
+        return [self.generate_for_env(i, cloth_centers_xyz[i], cloth_extent_m) for i in range(n_env)]
+</file>
+
+</files>
